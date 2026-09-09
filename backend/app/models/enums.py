@@ -24,3 +24,20 @@ class HouseholdStatus(StrEnum):
     SAFE = "safe"
     UNREACHED = "unreached"
     UNKNOWN = "unknown"
+
+
+class Severity(StrEnum):
+    """Severity gates behavior, not just wording (CLAUDE.md, Domain Rule 5).
+
+    ``evacuate_now`` skips any batching or rate-limit delay lower severities use.
+    """
+
+    ADVISORY = "advisory"
+    WARNING = "warning"
+    EVACUATE_NOW = "evacuate_now"
+
+
+class AlertStatus(StrEnum):
+    DRAFT = "draft"
+    DISPATCHING = "dispatching"
+    COMPLETED = "completed"

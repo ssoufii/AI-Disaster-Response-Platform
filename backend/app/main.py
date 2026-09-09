@@ -3,7 +3,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import households, zones
+from app.api import alerts, households, zones
 from app.exceptions import NotFoundError
 from app.logging_config import configure_logging
 
@@ -13,6 +13,7 @@ app = FastAPI(title="AI Disaster Response Platform")
 
 app.include_router(zones.router)
 app.include_router(households.router)
+app.include_router(alerts.router)
 
 
 @app.exception_handler(NotFoundError)
