@@ -21,3 +21,8 @@ class NotFoundError(DomainError):
 class ZoneNotFoundError(NotFoundError):
     def __init__(self, zone_id: object) -> None:
         super().__init__("Zone", zone_id)
+
+
+class AlertNotFoundError(NotFoundError):
+    def __init__(self, alert_id: object) -> None:
+        super().__init__("Alert", alert_id)
