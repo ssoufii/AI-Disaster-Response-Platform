@@ -124,6 +124,50 @@ async def test_get_alert_returns_full_draft(client: AsyncClient) -> None:
     assert body["created_at"]
 
 
+async def test_alert_round_trips_its_structured_facts(client: AsyncClient) -> None:
+    zone_id = await _create_zone(client)
+    facts = {
+        "shelter": "Lincoln High School, 400 Oak St",
+        "routes": ["Route 12 west"],
+        "leave_by": "18:00",
+    }
+
+    created = (
+        await client.post(
+            "/alerts",
+            json={
+                "title": "Wildfire evacuation",
+                "raw_message": "Leave the canyon now.",
+                "severity": "evacuate_now",
+                "facts": facts,
+                "zone_id": zone_id,
+            },
+        )
+    ).json()
+
+    # Content generation copies these verbatim, so they must survive the round
+    # trip exactly as the dispatcher typed them.
+    assert created["facts"] == facts
+    assert (await client.get(f"/alerts/{created['id']}")).json()["facts"] == facts
+
+
+async def test_alert_without_facts_defaults_to_an_empty_object(client: AsyncClient) -> None:
+    zone_id = await _create_zone(client)
+
+    response = await client.post(
+        "/alerts",
+        json={
+            "title": "Air quality advisory",
+            "raw_message": "Stay indoors.",
+            "severity": "advisory",
+            "zone_id": zone_id,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["facts"] == {}
+
+
 async def test_get_unknown_alert_is_404(client: AsyncClient) -> None:
     response = await client.get(f"/alerts/{uuid.uuid4()}")
 

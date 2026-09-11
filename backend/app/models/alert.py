@@ -13,8 +13,9 @@ string; the schemas in ``app/schemas/`` are the validation boundary.
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import Column, DateTime
+from sqlalchemy import JSON, Column, DateTime
 from sqlmodel import Field, SQLModel
 
 from app.models.enums import AlertStatus
@@ -27,6 +28,11 @@ class Alert(SQLModel, table=True):
     title: str
     raw_message: str
     severity: str
+    # Shelter addresses, evacuation routes, times, phone numbers — the details
+    # Claude must copy verbatim and may never invent (CLAUDE.md, Domain Rule 1).
+    # They are stored as labelled structured fields rather than buried in
+    # ``raw_message`` prose precisely so generation has nothing to drift on.
+    facts: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     zone_id: uuid.UUID = Field(foreign_key="zone.id", index=True)
     # Free-form dispatcher identifier until console auth lands (issue #20).
     created_by: str | None = Field(default=None)

@@ -27,6 +27,7 @@ async def create_alert(
         title=payload.title,
         raw_message=payload.raw_message,
         severity=payload.severity.value,
+        facts=payload.facts,
         zone_id=payload.zone_id,
         created_by=payload.created_by,
     )
