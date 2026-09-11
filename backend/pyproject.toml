@@ -5,6 +5,7 @@ description = "FastAPI backend for the AI Disaster Response Platform"
 requires-python = ">=3.11"
 dependencies = [
     "alembic>=1.13",
+    "anthropic>=1.5",
     "asyncpg>=0.29",
     "fastapi>=0.115",
     "pydantic-settings>=2.4",

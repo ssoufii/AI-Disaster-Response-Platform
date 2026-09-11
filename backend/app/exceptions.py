@@ -26,3 +26,11 @@ class ZoneNotFoundError(NotFoundError):
 class AlertNotFoundError(NotFoundError):
     def __init__(self, alert_id: object) -> None:
         super().__init__("Alert", alert_id)
+
+
+class ContentGenerationError(DomainError):
+    """Claude returned something that is not valid alert content.
+
+    Raised loudly rather than papered over: the caller decides whether to retry
+    or fall back to a pre-written template.
+    """

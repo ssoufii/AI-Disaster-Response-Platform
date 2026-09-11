@@ -44,6 +44,7 @@ Alert
 - title
 - raw_message (dispatcher's plain-English source alert)
 - severity ("advisory" | "warning" | "evacuate_now")
+- facts (JSON object: shelter, routes, times, phone numbers — the details Claude copies verbatim and may never invent; defaults to {})
 - zone_id
 - created_by
 - created_at
@@ -83,13 +84,14 @@ One backend service, `content_generator.py`, called once per household per alert
 
 **Design pattern: structured JSON output per household.**
 
-Prompt inputs:
+Prompt inputs, sent as a structured JSON object in the user message (never concatenated into prose):
 - `raw_message` (dispatcher's plain alert)
 - `severity`
 - `household.language`
 - `household.literacy_level`
 - `household.accessibility_needs`
 - `household.channel`
+- `alert.facts` (shelter, routes, times — labelled fields, so there is nothing for the model to drift into)
 
 Prompt asks Claude to return JSON:
 ```json
@@ -108,6 +110,11 @@ Key rules to bake into the system prompt:
 - Voice script must include a confirmation prompt (e.g. "Press 1 if you are safe and evacuating") since this is what the Twilio IVR uses to mark `confirmed_received`.
 
 This keeps Claude's role narrow, testable, and auditable — good for a disaster-response system where hallucination risk must be minimized.
+
+**Implementation notes** (`backend/app/services/content_generator.py`):
+- The response is constrained by a strict JSON schema (`output_config.format`, `additionalProperties: false`) generated from the `GeneratedAlertContent` Pydantic model in `app/schemas/alert_content.py`, and validated against that same model on the way back. `sms_text` carries a 160-character cap in the schema. Nothing parses free text — no regex, no markdown-fence stripping. A response that fails validation raises `ContentGenerationError`.
+- The system prompt is a frozen constant in `app/services/prompts/content_generation.py`, sent with `cache_control: ephemeral`. It is byte-identical for every household in a dispatch, which is the dispatch's single biggest cost lever.
+- The generated fields map onto the `AlertContent` table as: `sms_text` → `generated_text`, `voice_script` → `generated_script`, `asl_video_caption` → `video_caption_text`, `language_used` → `language`.
 
 ---
 
