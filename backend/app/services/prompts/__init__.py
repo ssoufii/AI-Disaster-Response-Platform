@@ -9,5 +9,11 @@ from app.services.prompts.content_generation import (
     CONTENT_SYSTEM_PROMPT,
     CONTENT_SYSTEM_PROMPT_V1,
 )
+from app.services.prompts.templates import TEMPLATES, template_for
 
-__all__ = ["CONTENT_SYSTEM_PROMPT", "CONTENT_SYSTEM_PROMPT_V1"]
+__all__ = [
+    "CONTENT_SYSTEM_PROMPT",
+    "CONTENT_SYSTEM_PROMPT_V1",
+    "TEMPLATES",
+    "template_for",
+]

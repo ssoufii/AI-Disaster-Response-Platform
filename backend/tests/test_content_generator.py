@@ -16,14 +16,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.config import settings
 from app.exceptions import ContentGenerationError
 from app.models.alert import Alert
 from app.models.enums import Channel, LiteracyLevel, Severity
 from app.models.household import Household
+from app.schemas.alert_content import GeneratedAlertContent
 from app.services import content_generator
-from app.services.prompts import CONTENT_SYSTEM_PROMPT
+from app.services.prompts import CONTENT_SYSTEM_PROMPT, TEMPLATES, template_for
 
 SHELTER_ADDRESS = "Lincoln High School, 400 Oak St"
 
@@ -63,21 +65,27 @@ def _household(**overrides: object) -> Household:
     return Household(**(defaults | overrides))
 
 
-def _fake_client(payload: object, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    """Install a stand-in Anthropic client returning ``payload`` as its text block.
-
-    ``payload`` is serialized if it is a dict, or sent as-is if it is already a
-    string — which is how the malformed-response tests deliver junk.
-    """
+def _text_response(payload: object) -> SimpleNamespace:
     text = payload if isinstance(payload, str) else json.dumps(payload)
-    response = SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
-    create = AsyncMock(return_value=response)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+
+
+def _install_client(create: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     monkeypatch.setattr(
         content_generator,
         "get_client",
         lambda: SimpleNamespace(messages=SimpleNamespace(create=create)),
     )
     return create
+
+
+def _fake_client(payload: object, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Install a stand-in Anthropic client returning ``payload`` as its text block.
+
+    ``payload`` is serialized if it is a dict, or sent as-is if it is already a
+    string — which is how the malformed-response tests deliver junk.
+    """
+    return _install_client(AsyncMock(return_value=_text_response(payload)), monkeypatch)
 
 
 async def test_generate_returns_validated_content(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -179,7 +187,7 @@ async def test_low_literacy_sms_over_160_characters_is_rejected(
     _fake_client({**VALID_RESPONSE, "sms_text": "Evacuate now. " * 20}, monkeypatch)
 
     with pytest.raises(ContentGenerationError):
-        await content_generator.generate(_alert(), _household())
+        await content_generator._generate_once(_alert(), _household())
 
 
 @pytest.mark.parametrize(
@@ -197,7 +205,7 @@ async def test_unvalidatable_response_fails_loudly(
     _fake_client(payload, monkeypatch)
 
     with pytest.raises(ContentGenerationError):
-        await content_generator.generate(_alert(), _household())
+        await content_generator._generate_once(_alert(), _household())
 
 
 async def test_response_without_a_text_block_fails_loudly(
@@ -212,4 +220,124 @@ async def test_response_without_a_text_block_fails_loudly(
     )
 
     with pytest.raises(ContentGenerationError):
-        await content_generator.generate(_alert(), _household())
+        await content_generator._generate_once(_alert(), _household())
+
+
+# --- Retry and template fallback (issue #5) ---------------------------------
+#
+# The contract these cover is CLAUDE.md's "never let a Claude failure block
+# delivery": one retry, then a pre-written template, never an exception out of
+# ``generate``. A household that gets a generic correct warning is a household
+# that got warned.
+
+
+async def test_invalid_response_is_retried_exactly_once_then_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create = _fake_client("not json at all", monkeypatch)
+
+    content = await content_generator.generate(_alert(), _household())
+
+    assert create.await_count == 2  # the call plus one retry, no more
+    assert content == template_for(Severity.EVACUATE_NOW.value, "es")
+
+
+async def test_retry_after_an_invalid_response_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create = _install_client(
+        AsyncMock(side_effect=[_text_response("not json at all"), _text_response(VALID_RESPONSE)]),
+        monkeypatch,
+    )
+
+    content = await content_generator.generate(_alert(), _household())
+
+    assert create.await_count == 2
+    assert content.sms_text == VALID_RESPONSE["sms_text"]  # generated, not a template
+
+
+async def test_client_exception_on_both_attempts_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create = _install_client(AsyncMock(side_effect=TimeoutError("read timed out")), monkeypatch)
+
+    content = await content_generator.generate(_alert(), _household())
+
+    assert create.await_count == 2
+    assert content == template_for(Severity.EVACUATE_NOW.value, "es")
+
+
+async def test_fallback_content_is_shaped_exactly_like_a_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_client("not json at all", monkeypatch)
+
+    content = await content_generator.generate(_alert(), _household())
+
+    # Same type, same fields, still schema-valid: no downstream branch exists
+    # for "this one was a fallback", and delivery is not skipped.
+    assert isinstance(content, GeneratedAlertContent)
+    assert GeneratedAlertContent.model_validate(content.model_dump()) == content
+    assert content.language_used == "es"
+
+
+async def test_fallback_is_logged_prominently_with_alert_and_household_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_client("not json at all", monkeypatch)
+    alert, household = _alert(), _household()
+
+    with capture_logs() as logs:
+        await content_generator.generate(alert, household)
+
+    fallback = [line for line in logs if line["event"] == "content_generation.template_fallback"]
+    assert len(fallback) == 1
+    assert fallback[0]["log_level"] == "warning"
+    assert fallback[0]["alert_id"] == str(alert.id)
+    assert fallback[0]["household_id"] == str(household.id)
+
+    # Each failed attempt is visible too, so the reason is in the log, not just
+    # the outcome.
+    attempts = [line for line in logs if line["event"] == "content_generation.attempt_failed"]
+    assert len(attempts) == 2
+    assert all(line["log_level"] == "warning" for line in attempts)
+
+
+async def test_fallback_uses_the_households_language_and_the_alerts_severity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_client("not json at all", monkeypatch)
+
+    content = await content_generator.generate(
+        _alert(severity=Severity.ADVISORY.value), _household(language="vi")
+    )
+
+    assert content == template_for(Severity.ADVISORY.value, "vi")
+    assert content.language_used == "vi"
+
+
+async def test_fallback_for_an_untemplated_language_degrades_to_english(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_client("not json at all", monkeypatch)
+
+    content = await content_generator.generate(_alert(), _household(language="so"))
+
+    # Not silence, and not a claim to be Somali it cannot back up.
+    assert content == template_for(Severity.EVACUATE_NOW.value, "en")
+    assert content.language_used == "en"
+
+
+def test_every_severity_and_language_has_a_valid_template() -> None:
+    for severity in Severity:
+        for language in ("en", "es", "vi"):
+            template = TEMPLATES[(severity.value, language)]
+            assert template.language_used == language
+            assert len(template.sms_text) <= 160
+            # The voice script carries the DTMF confirmation prompt the IVR
+            # depends on, exactly as a generated one would.
+            assert "1" in template.voice_script
+
+
+def test_template_lookup_never_raises_on_an_unknown_severity() -> None:
+    assert template_for("meteor", "en") == TEMPLATES[(Severity.WARNING.value, "en")]

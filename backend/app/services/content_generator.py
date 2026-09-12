@@ -13,8 +13,12 @@ Two rules shape everything here:
 2. Output is validated against a strict JSON schema. A response that does not
    validate is a failure, never something to repair by parsing free text.
 
-Retry-and-fall-back-to-a-template is deliberately *not* here: this module fails
-loudly, and issue #5 layers the retry/template contract on top.
+A failure is not, however, allowed to stop an alert. ``generate`` retries once
+and then returns the pre-written template for the household's severity and
+language, so a Claude outage or a malformed response degrades to a generic
+correct warning rather than silence (CLAUDE.md: "Never let a Claude failure
+block delivery"). The template is an ordinary ``GeneratedAlertContent`` —
+callers have no "this one was a fallback" branch to write.
 """
 
 import json
@@ -30,13 +34,18 @@ from app.exceptions import ContentGenerationError
 from app.models.alert import Alert
 from app.models.household import Household
 from app.schemas.alert_content import GeneratedAlertContent
-from app.services.prompts import CONTENT_SYSTEM_PROMPT
+from app.services.prompts import CONTENT_SYSTEM_PROMPT, template_for
 
 logger = structlog.get_logger(__name__)
 
 # Four short fields in any language; generous enough that a long voice script
 # is never truncated, small enough that a runaway generation fails fast.
 MAX_TOKENS = 2048
+
+# The first call plus a single retry. One retry covers the transient case — a
+# truncated response, a blip — without spending a live incident's minutes
+# re-asking a model that is clearly not answering. After that, the template.
+MAX_ATTEMPTS = 2
 
 
 @lru_cache
@@ -68,13 +77,51 @@ def _prompt_inputs(alert: Alert, household: Household) -> dict[str, Any]:
 
 
 async def generate(alert: Alert, household: Household) -> GeneratedAlertContent:
-    """Generate alert content for one household.
+    """Generate alert content for one household, or fall back to a template.
 
-    Raises ``ContentGenerationError`` if the response does not validate against
-    ``GeneratedAlertContent``.
+    Calls Claude, retrying once if the call fails or the response does not
+    validate. If the retry fails too, returns the pre-written template for the
+    alert's severity and the household's language and logs the fallback at
+    warning level so it is visible to whoever is watching logs during the
+    incident. Never raises: an undeliverable household is a worse outcome than
+    a generic warning.
     """
     log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
 
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return await _generate_once(alert, household)
+        except Exception as exc:
+            # Deliberately broad: a validation failure, a timeout, a 429, and a
+            # transport error all mean the same thing to this household — no
+            # content yet — and all of them end at the same template.
+            log.warning(
+                "content_generation.attempt_failed",
+                attempt=attempt,
+                attempts_allowed=MAX_ATTEMPTS,
+                model=settings.CLAUDE_MODEL,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
+    content = template_for(alert.severity, household.language)
+    log.warning(
+        "content_generation.template_fallback",
+        severity=alert.severity,
+        requested_language=household.language,
+        language_used=content.language_used,
+        attempts=MAX_ATTEMPTS,
+    )
+    return content
+
+
+async def _generate_once(alert: Alert, household: Household) -> GeneratedAlertContent:
+    """One Claude call, validated strictly.
+
+    Raises ``ContentGenerationError`` if the response does not validate against
+    ``GeneratedAlertContent``. Anything the SDK raises propagates untouched.
+    ``generate`` is what turns either of those into a logged retry.
+    """
     response = await get_client().messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=MAX_TOKENS,
@@ -105,16 +152,12 @@ async def generate(alert: Alert, household: Household) -> GeneratedAlertContent:
 
     raw = next((block.text for block in response.content if block.type == "text"), None)
     if raw is None:
-        log.warning("content_generation.no_text_block", model=settings.CLAUDE_MODEL)
         raise ContentGenerationError("Claude returned no text block")
 
     try:
         return GeneratedAlertContent.model_validate_json(raw)
     except ValidationError as exc:
         # Deliberately no salvage attempt — no regex, no fence stripping.
-        log.warning(
-            "content_generation.invalid_response",
-            model=settings.CLAUDE_MODEL,
-            error_count=exc.error_count(),
-        )
-        raise ContentGenerationError("Claude response failed schema validation") from exc
+        raise ContentGenerationError(
+            f"Claude response failed schema validation ({exc.error_count()} errors)"
+        ) from exc
