@@ -10,9 +10,11 @@ exists only in the alert's ``facts`` object must travel into the prompt as a
 labelled field and come back out verbatim.
 """
 
+import asyncio
 import json
 import uuid
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -341,3 +343,206 @@ def test_every_severity_and_language_has_a_valid_template() -> None:
 
 def test_template_lookup_never_raises_on_an_unknown_severity() -> None:
     assert template_for("meteor", "en") == TEMPLATES[(Severity.WARNING.value, "en")]
+
+
+# --- Zone fan-out and rate limits (issue #6) --------------------------------
+#
+# A dispatch is a zone, not a household: hundreds of generations at once,
+# bounded so the fan-out does not rate-limit itself, and resilient enough that
+# one household's permanent failure is one template rather than a dead batch.
+
+
+class _RateLimitError(Exception):
+    """Stand-in for an Anthropic 429/529.
+
+    Only the ``status_code`` attribute matters — that is what the generator
+    keys on, rather than the SDK's exception classes.
+    """
+
+    def __init__(self, status_code: int = 429) -> None:
+        super().__init__(f"rate limited ({status_code})")
+        self.status_code = status_code
+
+
+def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Replace the backoff sleep with a recorder, so tests observe delays for free."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(content_generator.asyncio, "sleep", fake_sleep)
+    return slept
+
+
+def _echo_language_client(monkeypatch: pytest.MonkeyPatch, fail_language: str | None = None):
+    """A client that answers in whatever language was asked for.
+
+    Echoing ``target_language`` back as ``language_used`` is what lets the
+    fan-out tests tell one household's content from another's. A household
+    whose language is ``fail_language`` gets junk on every attempt, standing in
+    for a household whose generation permanently fails.
+    """
+
+    async def create(**kwargs: Any) -> SimpleNamespace:
+        sent = json.loads(kwargs["messages"][0]["content"])
+        # Yield control so concurrent calls actually overlap rather than each
+        # running to completion before the next one starts.
+        await asyncio.sleep(0)
+        if sent["target_language"] == fail_language:
+            return _text_response("not json at all")
+        return _text_response({**VALID_RESPONSE, "language_used": sent["target_language"]})
+
+    monkeypatch.setattr(
+        content_generator,
+        "get_client",
+        lambda: SimpleNamespace(messages=SimpleNamespace(create=create)),
+    )
+
+
+@pytest.mark.parametrize("status_code", [429, 529])
+async def test_rate_limited_call_backs_off_and_succeeds_on_retry(
+    status_code: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slept = _record_sleeps(monkeypatch)
+    create = _install_client(
+        AsyncMock(side_effect=[_RateLimitError(status_code), _text_response(VALID_RESPONSE)]),
+        monkeypatch,
+    )
+
+    content = await content_generator.generate(_alert(), _household())
+
+    assert create.await_count == 2
+    assert slept == [content_generator.INITIAL_BACKOFF_SECONDS]
+    # The batch is unharmed: this household got real content, not a template.
+    assert content.sms_text == VALID_RESPONSE["sms_text"]
+
+
+async def test_persistent_rate_limit_backs_off_exponentially_then_templates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept = _record_sleeps(monkeypatch)
+    create = _install_client(AsyncMock(side_effect=_RateLimitError()), monkeypatch)
+
+    content = await content_generator.generate(_alert(), _household())
+
+    # A rate limit earns more attempts than a malformed response does — it says
+    # the request was fine, only the timing was wrong.
+    assert create.await_count == content_generator.MAX_RATE_LIMIT_ATTEMPTS
+    assert slept == [1.0, 2.0, 4.0]  # doubling, not a tight retry loop
+    assert content == template_for(Severity.EVACUATE_NOW.value, "es")
+
+
+async def test_a_malformed_response_is_retried_without_backing_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept = _record_sleeps(monkeypatch)
+    create = _fake_client("not json at all", monkeypatch)
+
+    await content_generator.generate(_alert(), _household())
+
+    # Waiting does not make a broken response valid, so nothing sleeps here.
+    assert create.await_count == content_generator.MAX_ATTEMPTS
+    assert slept == []
+
+
+async def test_zone_generation_keeps_calls_in_flight_within_the_configured_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    in_flight = 0
+    peak = 0
+
+    async def create(**_kwargs: Any) -> SimpleNamespace:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return _text_response(VALID_RESPONSE)
+
+    monkeypatch.setattr(
+        content_generator,
+        "get_client",
+        lambda: SimpleNamespace(messages=SimpleNamespace(create=create)),
+    )
+    households = [_household(phone_number=f"+1555555{i:04d}") for i in range(50)]
+
+    contents = await content_generator.generate_for_zone(_alert(), households)
+
+    assert settings.CLAUDE_CONCURRENCY == 10  # the documented default
+    assert peak == settings.CLAUDE_CONCURRENCY  # concurrent, but never beyond the bound
+    assert len(contents) == 50
+
+
+async def test_zone_generation_honors_a_lowered_concurrency_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "CLAUDE_CONCURRENCY", 3)
+    in_flight = 0
+    peak = 0
+
+    async def create(**_kwargs: Any) -> SimpleNamespace:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return _text_response(VALID_RESPONSE)
+
+    monkeypatch.setattr(
+        content_generator,
+        "get_client",
+        lambda: SimpleNamespace(messages=SimpleNamespace(create=create)),
+    )
+    households = [_household(phone_number=f"+1555556{i:04d}") for i in range(20)]
+
+    await content_generator.generate_for_zone(_alert(), households)
+
+    assert peak == 3
+
+
+async def test_zone_generation_returns_one_content_per_household_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _echo_language_client(monkeypatch)
+    languages = ["en", "es", "vi", "en", "es"]
+    households = [
+        _household(phone_number=f"+1555557{i:04d}", language=language)
+        for i, language in enumerate(languages)
+    ]
+
+    contents = await content_generator.generate_for_zone(_alert(), households)
+
+    # One content per household, paired by position — which is what lets the
+    # caller write exactly one AlertContent row per household.
+    assert [content.language_used for content in contents] == languages
+
+
+async def test_one_permanently_failing_household_does_not_fail_the_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _echo_language_client(monkeypatch, fail_language="vi")
+    households = [
+        _household(phone_number="+15555580001", language="en"),
+        _household(phone_number="+15555580002", language="vi"),
+        _household(phone_number="+15555580003", language="es"),
+    ]
+
+    contents = await content_generator.generate_for_zone(_alert(), households)
+
+    assert len(contents) == 3
+    # The failing household falls back to its template...
+    assert contents[1] == template_for(Severity.EVACUATE_NOW.value, "vi")
+    # ...while its neighbours' generations complete normally.
+    assert contents[0].language_used == "en"
+    assert contents[2].language_used == "es"
+    assert contents[0].sms_text == VALID_RESPONSE["sms_text"]
+
+
+async def test_zone_generation_of_an_empty_zone_is_a_no_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create = _fake_client(VALID_RESPONSE, monkeypatch)
+
+    assert await content_generator.generate_for_zone(_alert(), []) == []
+    assert create.await_count == 0
