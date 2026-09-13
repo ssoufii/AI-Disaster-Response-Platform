@@ -19,9 +19,20 @@ language, so a Claude outage or a malformed response degrades to a generic
 correct warning rather than silence (CLAUDE.md: "Never let a Claude failure
 block delivery"). The template is an ordinary ``GeneratedAlertContent`` —
 callers have no "this one was a fallback" branch to write.
+
+A rate limit is the one failure worth waiting out rather than falling back on.
+A 429 or 529 means "ask again shortly", not "this response is broken", so it
+earns extra attempts spaced by exponential backoff — otherwise a zone-wide
+dispatch that trips the rate limit would hand every remaining household a
+template while the API was merely busy.
+
+``generate_for_zone`` is the whole-zone entry point: the same per-household
+contract run concurrently, bounded by ``config.CLAUDE_CONCURRENCY``.
 """
 
+import asyncio
 import json
+from collections.abc import Sequence
 from functools import lru_cache
 from typing import Any
 
@@ -46,6 +57,16 @@ MAX_TOKENS = 2048
 # truncated response, a blip — without spending a live incident's minutes
 # re-asking a model that is clearly not answering. After that, the template.
 MAX_ATTEMPTS = 2
+
+# A rate limit is a different kind of failure: the request was fine, the API is
+# busy. Four attempts spaced 1s, 2s, 4s ride out roughly seven seconds of
+# throttling, which is what a large zone's fan-out tends to provoke, without
+# leaving a household waiting long enough to matter.
+MAX_RATE_LIMIT_ATTEMPTS = 4
+INITIAL_BACKOFF_SECONDS = 1.0
+
+# 429 is Anthropic's rate limit; 529 is "overloaded". Both mean "retry shortly".
+RATE_LIMIT_STATUS_CODES = frozenset({429, 529})
 
 
 @lru_cache
@@ -76,33 +97,57 @@ def _prompt_inputs(alert: Alert, household: Household) -> dict[str, Any]:
     }
 
 
+def _is_rate_limited(exc: Exception) -> bool:
+    """Whether an exception is the API asking us to slow down.
+
+    Duck-typed on ``status_code`` rather than matched against the SDK's
+    exception classes: every Anthropic error that carries an HTTP status exposes
+    it, and nothing else in this path does.
+    """
+    return getattr(exc, "status_code", None) in RATE_LIMIT_STATUS_CODES
+
+
 async def generate(alert: Alert, household: Household) -> GeneratedAlertContent:
     """Generate alert content for one household, or fall back to a template.
 
     Calls Claude, retrying once if the call fails or the response does not
-    validate. If the retry fails too, returns the pre-written template for the
-    alert's severity and the household's language and logs the fallback at
+    validate, and retrying a rate limit (429/529) further with exponential
+    backoff. When the attempts are spent, returns the pre-written template for
+    the alert's severity and the household's language and logs the fallback at
     warning level so it is visible to whoever is watching logs during the
     incident. Never raises: an undeliverable household is a worse outcome than
     a generic warning.
     """
     log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
+    attempt = 0
+    backoff = INITIAL_BACKOFF_SECONDS
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    while True:
+        attempt += 1
         try:
             return await _generate_once(alert, household)
         except Exception as exc:
-            # Deliberately broad: a validation failure, a timeout, a 429, and a
+            # Deliberately broad: a validation failure, a timeout, and a
             # transport error all mean the same thing to this household — no
-            # content yet — and all of them end at the same template.
+            # content yet — and all of them end at the same template. Only a
+            # rate limit is treated differently, because only a rate limit says
+            # the request itself was fine.
+            rate_limited = _is_rate_limited(exc)
+            attempts_allowed = MAX_RATE_LIMIT_ATTEMPTS if rate_limited else MAX_ATTEMPTS
             log.warning(
                 "content_generation.attempt_failed",
                 attempt=attempt,
-                attempts_allowed=MAX_ATTEMPTS,
+                attempts_allowed=attempts_allowed,
+                rate_limited=rate_limited,
                 model=settings.CLAUDE_MODEL,
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
+            if attempt >= attempts_allowed:
+                break
+            if rate_limited:
+                await asyncio.sleep(backoff)
+                backoff *= 2
 
     content = template_for(alert.severity, household.language)
     log.warning(
@@ -110,9 +155,47 @@ async def generate(alert: Alert, household: Household) -> GeneratedAlertContent:
         severity=alert.severity,
         requested_language=household.language,
         language_used=content.language_used,
-        attempts=MAX_ATTEMPTS,
+        attempts=attempt,
     )
     return content
+
+
+async def generate_for_zone(
+    alert: Alert, households: Sequence[Household]
+) -> list[GeneratedAlertContent]:
+    """Generate content for every household in a zone, concurrently but bounded.
+
+    Returns one ``GeneratedAlertContent`` per household, in the order the
+    households were given.
+
+    A zone is hundreds of households, so the fan-out runs concurrently — but
+    behind a semaphore sized by ``config.CLAUDE_CONCURRENCY``, because a
+    dispatch that opens hundreds of simultaneous calls rate-limits itself and
+    ends up slower than one that paces itself.
+
+    One household never sinks the batch: ``generate`` does not raise, so a
+    household whose generation permanently fails takes its template and every
+    other household completes normally.
+
+    No batching delay is applied at any severity, so Domain Rule 5's
+    "``evacuate_now`` skips any batching delay" needs no special case here —
+    there is none to skip.
+    """
+    log = logger.bind(alert_id=str(alert.id))
+    semaphore = asyncio.Semaphore(settings.CLAUDE_CONCURRENCY)
+
+    async def generate_bounded(household: Household) -> GeneratedAlertContent:
+        async with semaphore:
+            return await generate(alert, household)
+
+    log.info(
+        "content_generation.zone_started",
+        households=len(households),
+        concurrency=settings.CLAUDE_CONCURRENCY,
+    )
+    contents = await asyncio.gather(*(generate_bounded(h) for h in households))
+    log.info("content_generation.zone_complete", households=len(contents))
+    return list(contents)
 
 
 async def _generate_once(alert: Alert, household: Household) -> GeneratedAlertContent:

@@ -119,6 +119,14 @@ This keeps Claude's role narrow, testable, and auditable — good for a disaster
 - The system prompt is a frozen constant in `app/services/prompts/content_generation.py`, sent with `cache_control: ephemeral`. It is byte-identical for every household in a dispatch, which is the dispatch's single biggest cost lever.
 - The generated fields map onto the `AlertContent` table as: `sms_text` → `generated_text`, `voice_script` → `generated_script`, `asl_video_caption` → `video_caption_text`, `language_used` → `language`.
 
+**Zone fan-out** (`generate_for_zone`):
+- A dispatch generates for a whole zone, so `generate_for_zone(alert, households)` runs `generate()` for every household under `asyncio.gather` with an `asyncio.Semaphore` sized by `config.CLAUDE_CONCURRENCY` (default 10). The bound is the point: hundreds of simultaneous calls rate-limit the dispatch against itself and finish slower than a paced fan-out, while too low a bound leaves a large zone waiting during an emergency. It returns one `GeneratedAlertContent` per household, in the order given, which is what lets the caller write exactly one `AlertContent` row per household.
+- **A rate limit is retried, not fallen back on.** A 429 or 529 says the request was fine and the API is busy, so `generate()` gives it four attempts spaced by exponential backoff (1s, 2s, 4s) before the template — as distinct from a malformed response, which gets the single immediate retry above, since waiting does not make an invalid response valid. Without that distinction a zone that trips the rate limit would hand every remaining household a factless template while the API was merely throttling.
+- Because `generate()` never raises, one household's permanent failure is one template row, never a failed batch — the other households' generations complete normally.
+- No batching or rate-limit *delay* is applied at any severity, so Domain Rule 5's "`evacuate_now` skips any batching delay" needs no special case: there is none to skip.
+
+**Dispatch wiring** (`POST /alerts/{id}/dispatch`, `app/api/alerts.py`): generation is the first phase of a dispatch — it fetches the alert's zone's households, generates for those that do not already have an `AlertContent` row for this alert, writes one row each, and moves the alert to `dispatching`. Skipping households that already have content is what makes re-dispatching safe: a household never gets a second row for the same alert. Delivery (DeliveryAttempts, Twilio sends) hangs off the same endpoint and is covered in section 4.
+
 ---
 
 ## 4. Twilio — Delivery Layer

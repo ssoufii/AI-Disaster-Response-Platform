@@ -23,6 +23,21 @@ class AlertCreate(BaseModel):
     created_by: str | None = None
 
 
+class AlertDispatchRead(BaseModel):
+    """What the content-generation phase of a dispatch did.
+
+    ``content_generated`` counts the households generated for on this call;
+    households that already had content for this alert are counted in
+    ``households`` but not regenerated, so dispatching twice does not produce a
+    second AlertContent row for anyone.
+    """
+
+    alert_id: uuid.UUID
+    status: AlertStatus
+    households: int
+    content_generated: int
+
+
 class AlertRead(BaseModel):
     id: uuid.UUID
     title: str
