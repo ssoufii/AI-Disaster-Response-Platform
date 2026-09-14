@@ -41,3 +41,20 @@ class AlertStatus(StrEnum):
     DRAFT = "draft"
     DISPATCHING = "dispatching"
     COMPLETED = "completed"
+
+
+class DeliveryStatus(StrEnum):
+    """Where one delivery attempt stands.
+
+    ``DELIVERED`` means Twilio handed the message off; it is not a receipt.
+    ``CONFIRMED_RECEIVED`` is the only status that means a human acted, and it
+    only ever arrives from an explicit keypress or reply (CLAUDE.md, Domain
+    Rule 6). Nothing may infer one from the other.
+    """
+
+    QUEUED = "queued"
+    SENDING = "sending"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    NO_ANSWER = "no_answer"
+    CONFIRMED_RECEIVED = "confirmed_received"

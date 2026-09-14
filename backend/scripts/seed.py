@@ -23,7 +23,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.db import async_session_factory
-from app.logging_config import configure_logging
+from app.logging_config import configure_logging, redact_phone
 from app.models.enums import Channel, LiteracyLevel
 from app.models.household import Household
 from app.models.zone import Zone
@@ -105,11 +105,6 @@ HOUSEHOLD_SEEDS: tuple[HouseholdSeed, ...] = (
 )
 
 
-def redact(phone_number: str) -> str:
-    """Last 4 digits only — full numbers are never logged (CLAUDE.md)."""
-    return f"***{phone_number[-4:]}"
-
-
 async def get_or_create_zone(session: AsyncSession, name: str) -> Zone:
     """Fetch the demo zone by name, creating it on the first run."""
     existing = (await session.exec(select(Zone).where(Zone.name == name))).first()
@@ -145,7 +140,7 @@ async def upsert_household(session: AsyncSession, seed: HouseholdSeed, zone: Zon
     log.info(
         "seed.household_upserted",
         household_id=str(household.id),
-        phone_number=redact(household.phone_number),
+        phone_number=redact_phone(household.phone_number),
         preferred_channel=household.preferred_channel,
         created=existing is None,
     )
