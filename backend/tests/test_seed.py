@@ -8,6 +8,7 @@ from httpx import AsyncClient
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.logging_config import redact_phone
 from app.models.enums import Channel, HouseholdStatus, LiteracyLevel
 from app.models.household import Household
 from app.models.zone import Zone
@@ -15,7 +16,6 @@ from scripts.seed import (
     HOUSEHOLD_SEEDS,
     SEED_ZONE_NAME,
     TWILIO_UNDELIVERABLE_SMS_NUMBER,
-    redact,
     seed_demo_data,
 )
 
@@ -122,5 +122,5 @@ async def test_seeded_profiles_are_visible_through_the_zone_endpoint(
 
 
 def test_redact_keeps_only_the_last_four_digits() -> None:
-    assert redact("+15550100001") == "***0001"
-    assert "5550100001" not in redact("+15550100001")
+    assert redact_phone("+15550100001") == "***0001"
+    assert "5550100001" not in redact_phone("+15550100001")

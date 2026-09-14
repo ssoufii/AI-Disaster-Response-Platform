@@ -9,6 +9,15 @@ import logging
 import structlog
 
 
+def redact_phone(phone_number: str) -> str:
+    """Last 4 digits only — full numbers are never logged (CLAUDE.md).
+
+    Lives here rather than in the delivery path so every caller that logs a
+    household's number reaches for the same one-liner.
+    """
+    return f"***{phone_number[-4:]}"
+
+
 def configure_logging() -> None:
     logging.basicConfig(format="%(message)s", level=logging.INFO)
     structlog.configure(

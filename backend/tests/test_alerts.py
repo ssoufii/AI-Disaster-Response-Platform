@@ -360,6 +360,7 @@ async def test_dispatch_of_a_zone_with_no_households_is_a_no_op(
         "status": "dispatching",
         "households": 0,
         "content_generated": 0,
+        "deliveries_started": 0,
     }
     assert seen == []
 

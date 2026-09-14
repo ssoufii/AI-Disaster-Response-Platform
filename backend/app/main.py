@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from app.api import alerts, households, zones
 from app.exceptions import NotFoundError
 from app.logging_config import configure_logging
+from app.webhooks import twilio_status
 
 configure_logging()
 
@@ -14,6 +15,7 @@ app = FastAPI(title="AI Disaster Response Platform")
 app.include_router(zones.router)
 app.include_router(households.router)
 app.include_router(alerts.router)
+app.include_router(twilio_status.router)
 
 
 @app.exception_handler(NotFoundError)

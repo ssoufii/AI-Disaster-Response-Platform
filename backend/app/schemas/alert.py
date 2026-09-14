@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.models.enums import AlertStatus, Severity
+from app.schemas.delivery_attempt import HouseholdDeliveryStatus
 
 
 class AlertCreate(BaseModel):
@@ -24,18 +25,36 @@ class AlertCreate(BaseModel):
 
 
 class AlertDispatchRead(BaseModel):
-    """What the content-generation phase of a dispatch did.
+    """What a dispatch's two phases did: generate, then deliver.
 
-    ``content_generated`` counts the households generated for on this call;
-    households that already had content for this alert are counted in
-    ``households`` but not regenerated, so dispatching twice does not produce a
-    second AlertContent row for anyone.
+    ``content_generated`` counts the households generated for on this call and
+    ``deliveries_started`` the attempts sent; households that already had
+    content or an attempt for this alert are counted in ``households`` but not
+    redone, so dispatching twice neither produces a second AlertContent row nor
+    sends anyone the same warning twice.
+
+    ``deliveries_started`` can trail ``households`` legitimately: only SMS is
+    wired up so far, so households on a channel still ahead in the build order
+    are counted but not attempted.
     """
 
     alert_id: uuid.UUID
     status: AlertStatus
     households: int
     content_generated: int
+    deliveries_started: int
+
+
+class AlertStatusRead(BaseModel):
+    """The full delivery snapshot for one alert.
+
+    What the dispatcher console loads on page open, *before* it subscribes to
+    the WebSocket — so the grid is never blank while the socket connects.
+    """
+
+    alert_id: uuid.UUID
+    status: AlertStatus
+    households: list[HouseholdDeliveryStatus]
 
 
 class AlertRead(BaseModel):

@@ -155,6 +155,22 @@ on DeliveryAttempt terminal failure (failed / no_answer / undelivered):
 ```
 This loop is what the resume line "re-routing failed deliveries to a fallback channel without manual intervention" refers to — implement it as an async task triggered directly from the status webhook handler, not a polling cron, so it's genuinely real-time.
 
+**Implementation notes** (`backend/app/services/delivery_service.py`):
+- The Twilio SDK is instantiated here and nowhere else, behind a lazily-built `get_client()` so importing the module (in tests, in Alembic) never needs credentials. The client is backed by `AsyncTwilioHttpClient` and sends via `messages.create_async`, because a zone dispatch sends from inside the request path and no blocking I/O is allowed there.
+- **The `DeliveryAttempt` row is committed as `queued` before Twilio is called.** A send that raises — or a process that dies mid-call — still leaves the evidence that this household was tried. The row exists because we tried, not because Twilio answered (Domain Rule 2).
+- Every send sets `status_callback` to `{PUBLIC_BASE_URL}/webhooks/twilio/status`. A send without it is a send whose outcome is unknowable, since nothing polls Twilio for status.
+- A Twilio error is caught, recorded on that household's attempt as `failed` with `error_reason`, and logged; it never propagates into the dispatch loop and strands the households behind it. Rerouting that failure onto the next channel is webhook-triggered and lands with issue #12 — until then a failed attempt stops at a failed row.
+- `deliver_alert` skips households that already have an attempt for this alert, so re-dispatching never sends the same warning twice — the same promise content generation makes about its rows.
+- Only the SMS channel is wired up so far. A household whose `preferred_channel` is voice (#16) or video/WhatsApp (#19) is logged and left without an attempt rather than sent something it cannot receive. That is a build-order gap, **not** Domain Rule 4's `unreached`, which means an exhausted fallback chain and is issue #13's to set.
+- Delivery-path log lines carry `alert_id` and `household_id`, and phone numbers only ever appear through `redact_phone` (last 4 digits) from `app/logging_config.py`.
+
+**Status webhook** (`backend/app/webhooks/twilio_status.py`, `POST /webhooks/twilio/status`):
+- Looks the attempt up by the SID Twilio quotes back (`MessageSid`, or the legacy `SmsSid`), maps Twilio's status onto `DeliveryStatus`, sets `completed_at` on a terminal status, records `ErrorCode: ErrorMessage` as `error_reason` on a failure, and returns. Nothing slow belongs here — no Claude generation, no outbound send — because Twilio times the callback out and retries.
+- Status map: `accepted`/`queued`/`scheduled` → `queued`; `sending`/`sent` → `sending`; `delivered` → `delivered`; `undelivered`/`failed` → `failed`. `sent` is Twilio's "handed to the carrier" — still in flight, and never a receipt (Domain Rule 6). Voice's `ringing`, `in-progress`, `completed`, `no-answer` and `busy` arrive with issue #16 and are deliberately absent rather than guessed at.
+- An unknown SID or an unmapped status is logged and ignored **with a 200**: a 4xx only makes Twilio retry a callback that can never be placed. The response body (`{"result": "applied" | "ignored", ...}`) says which happened, so the endpoint is debuggable from the outside during an incident.
+- The body is read with `urllib.parse.parse_qsl` rather than `request.form()` — Twilio posts `application/x-www-form-urlencoded`, so the standard library covers it and the service needs no multipart dependency. Signature validation (#8) wants exactly that params dict.
+- **Still missing, each its own issue:** signature validation (#8) and idempotency under Twilio's retries (#9). Until those land the endpoint is trusted-network only.
+
 ---
 
 ## 5. FastAPI Backend
@@ -180,8 +196,19 @@ This loop is what the resume line "re-routing failed deliveries to a fallback ch
 
 Key endpoints:
 - `POST /alerts` — dispatcher drafts an alert (raw_message, severity, zone_id)
-- `POST /alerts/{id}/dispatch` — triggers: fetch households in zone → generate content per household (async, e.g. `asyncio.gather` with concurrency limit) → create DeliveryAttempts → send via Twilio
-- `GET /alerts/{id}/status` — full current snapshot (used on dispatcher console page load, before WebSocket takes over)
+- `POST /alerts/{id}/dispatch` — triggers: fetch households in zone → generate content per household (async, e.g. `asyncio.gather` with concurrency limit) → create DeliveryAttempts → send via Twilio. Returns `{alert_id, status, households, content_generated, deliveries_started}`; `deliveries_started` can legitimately trail `households`, since a household on a channel still ahead in the build order is counted but not attempted. Delivery *outcomes* never come back from here — the send only hands the message to Twilio, and whether it arrived is reported later by webhook.
+- `GET /alerts/{id}/status` — full current snapshot (used on dispatcher console page load, before WebSocket takes over). Lives in `api/alerts.py` alongside the other alert routes. Returns `{alert_id, status, households: [...]}`, one entry per household **in the alert's zone** — including households with no attempt yet, whose `current_attempt` is `null`, because a household missing from the snapshot is a household nobody is watching:
+  ```json
+  {
+    "household_id": "...", "name": "Baker household",
+    "preferred_channel": "sms", "last_known_status": "unknown",
+    "current_attempt": {
+      "id": "...", "channel": "sms", "attempt_number": 1, "status": "delivered",
+      "twilio_sid": "SM...", "started_at": "...", "completed_at": "...", "error_reason": null
+    }
+  }
+  ```
+  `current_attempt` is the household's highest `attempt_number` — attempts are ordered by the fallback chain that produced them, not by wall clock. Earlier attempts stay exactly where they are; this only picks which one the snapshot shows. The full per-household attempt history is the DeliveryTimeline's (#14).
 - `WS /ws/alerts/{id}` — dispatcher console subscribes here for live updates
 - `POST /webhooks/twilio/status` — Twilio calls this on every delivery state change
 
