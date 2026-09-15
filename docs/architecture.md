@@ -165,11 +165,15 @@ This loop is what the resume line "re-routing failed deliveries to a fallback ch
 - Delivery-path log lines carry `alert_id` and `household_id`, and phone numbers only ever appear through `redact_phone` (last 4 digits) from `app/logging_config.py`.
 
 **Status webhook** (`backend/app/webhooks/twilio_status.py`, `POST /webhooks/twilio/status`):
+- **Every callback's `X-Twilio-Signature` is validated before anything else happens.** Twilio reaches this endpoint from the public internet, so it cannot be authenticated like the rest of the API; the signature is what stands in its place. Validation lives in a FastAPI dependency (`verified_twilio_params`), so a forged callback is refused with a **403** before the handler runs and therefore before any row is read or written — the endpoint fails closed rather than process-then-reject. Without it, anyone who found the URL could post forged delivery state into the audit trail, or trigger fallback rerouting (#12) against real households.
+- The signature is checked against `{PUBLIC_BASE_URL}/webhooks/twilio/status` — the same URL `delivery_service` hands Twilio as the `statusCallback`, so the two cannot drift, and the only URL that can be right in deployment: ngrok (or any proxy) terminates TLS and rewrites the host, so `request.url` is the internal address, not the one Twilio signed.
+- An empty `TWILIO_AUTH_TOKEN` means nothing can be verified, so every callback is refused. A deployment that forgot the variable gets a shut endpoint, not an open one.
+- A rejection is logged (`twilio_status.invalid_signature`, or `twilio_status.signature_unverifiable` when the token is missing) with the URL and whether a signature was present. Neither the auth token nor the presented signature is ever logged.
 - Looks the attempt up by the SID Twilio quotes back (`MessageSid`, or the legacy `SmsSid`), maps Twilio's status onto `DeliveryStatus`, sets `completed_at` on a terminal status, records `ErrorCode: ErrorMessage` as `error_reason` on a failure, and returns. Nothing slow belongs here — no Claude generation, no outbound send — because Twilio times the callback out and retries.
 - Status map: `accepted`/`queued`/`scheduled` → `queued`; `sending`/`sent` → `sending`; `delivered` → `delivered`; `undelivered`/`failed` → `failed`. `sent` is Twilio's "handed to the carrier" — still in flight, and never a receipt (Domain Rule 6). Voice's `ringing`, `in-progress`, `completed`, `no-answer` and `busy` arrive with issue #16 and are deliberately absent rather than guessed at.
 - An unknown SID or an unmapped status is logged and ignored **with a 200**: a 4xx only makes Twilio retry a callback that can never be placed. The response body (`{"result": "applied" | "ignored", ...}`) says which happened, so the endpoint is debuggable from the outside during an incident.
-- The body is read with `urllib.parse.parse_qsl` rather than `request.form()` — Twilio posts `application/x-www-form-urlencoded`, so the standard library covers it and the service needs no multipart dependency. Signature validation (#8) wants exactly that params dict.
-- **Still missing, each its own issue:** signature validation (#8) and idempotency under Twilio's retries (#9). Until those land the endpoint is trusted-network only.
+- The body is read with `urllib.parse.parse_qsl` rather than `request.form()` — Twilio posts `application/x-www-form-urlencoded`, so the standard library covers it and the service needs no multipart dependency. Signature validation checks exactly that params dict, and hands it to the handler, so the body is parsed once.
+- **Still missing:** idempotency under Twilio's retries (#9). Until it lands, a retried callback is applied twice.
 
 ---
 
@@ -210,7 +214,7 @@ Key endpoints:
   ```
   `current_attempt` is the household's highest `attempt_number` — attempts are ordered by the fallback chain that produced them, not by wall clock. Earlier attempts stay exactly where they are; this only picks which one the snapshot shows. The full per-household attempt history is the DeliveryTimeline's (#14).
 - `WS /ws/alerts/{id}` — dispatcher console subscribes here for live updates
-- `POST /webhooks/twilio/status` — Twilio calls this on every delivery state change
+- `POST /webhooks/twilio/status` — Twilio calls this on every delivery state change; a request whose `X-Twilio-Signature` does not validate is refused with a 403 before any state is touched
 
 **WebSocket message schema** (server → client):
 ```json

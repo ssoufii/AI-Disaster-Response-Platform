@@ -9,27 +9,40 @@ Twilio quotes, apply the status, return 200. Nothing slow belongs here — no
 Claude generation, no outbound send — because Twilio times the callback out and
 retries, and a slow handler turns one delivery into a pile of duplicates.
 
-Two things this endpoint still needs and does not yet have, each its own issue:
-signature validation (#8) and idempotency under Twilio's retries (#9). Until
-those land, treat the handler as trusted-network only.
+Twilio reaches this endpoint from the public internet, so it cannot be
+authenticated the way the rest of the API is. What stands in its place is the
+signature check below: every callback must carry an ``X-Twilio-Signature`` that
+only the account's auth token can produce, or it is refused with a 403 before a
+single row is read. Without it, anyone who found the URL could post forged
+delivery state into the audit trail — or, once #12 lands, trigger rerouting
+against real households.
+
+Idempotency under Twilio's retries (#9) is still missing.
 """
 
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl
 
 import structlog
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
+from twilio.request_validator import RequestValidator
 
+from app.config import settings
 from app.db import get_session
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import DeliveryStatus
 from app.schemas.delivery_attempt import TwilioStatusAck
+from app.services.delivery_service import status_callback_url
 
 router = APIRouter(prefix="/webhooks/twilio", tags=["webhooks"])
 
 logger = structlog.get_logger(__name__)
+
+# Twilio signs each callback with the account auth token and quotes the result
+# here.
+SIGNATURE_HEADER = "X-Twilio-Signature"
 
 # Twilio's message statuses, mapped onto ours. Voice adds `ringing`,
 # `in-progress`, `completed`, `no-answer` and `busy`; those arrive with the
@@ -61,18 +74,61 @@ async def _form_params(request: Request) -> dict[str, str]:
     Parsed from the raw body rather than via ``request.form()`` so the endpoint
     needs no multipart dependency: Twilio posts
     ``application/x-www-form-urlencoded``, which the standard library reads
-    directly. Signature validation (#8) wants exactly this dict.
+    directly. Signature validation checks exactly this dict, which is why the
+    handler receives its params from the validating dependency rather than
+    parsing the body a second time.
     """
     body = (await request.body()).decode("utf-8", errors="replace")
     return dict(parse_qsl(body, keep_blank_values=True))
 
 
+async def verified_twilio_params(request: Request) -> dict[str, str]:
+    """The callback's form params, once its signature proves Twilio sent them.
+
+    A dependency rather than a check inside the handler, so the refusal happens
+    before the handler runs and there is no path on which a forged callback
+    touches the database — the endpoint fails closed, it does not
+    process-then-reject.
+
+    The signature covers the URL Twilio posted to, and the URL checked here is
+    ``PUBLIC_BASE_URL`` — the same one ``delivery_service`` hands Twilio as the
+    ``statusCallback``, so the two can never drift. It is also the only URL that
+    can be right in deployment: ngrok (and any proxy) terminates TLS and rewrites
+    the host, so ``request.url`` is the internal address, not the one Twilio
+    signed.
+    """
+    params = await _form_params(request)
+    signature = request.headers.get(SIGNATURE_HEADER, "")
+    url = status_callback_url()
+
+    if not settings.TWILIO_AUTH_TOKEN:
+        # Nothing to validate against means nothing can be trusted. Refusing is
+        # the only safe reading: the alternative is an open endpoint on whichever
+        # deployment forgot the variable.
+        logger.error("twilio_status.signature_unverifiable", url=url)
+        raise HTTPException(status_code=403, detail="Twilio signature cannot be verified")
+
+    if not RequestValidator(settings.TWILIO_AUTH_TOKEN).validate(url, params, signature):
+        # The presented signature and the token are both left out of the log: one
+        # is a secret, the other is noise. What an operator needs is that a
+        # forgery arrived, and against which URL.
+        logger.warning(
+            "twilio_status.invalid_signature",
+            url=url,
+            signature_present=bool(signature),
+            fields=sorted(params),
+        )
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    return params
+
+
 @router.post("/status", response_model=TwilioStatusAck)
 async def twilio_status(
-    request: Request, session: AsyncSession = Depends(get_session)
+    params: dict[str, str] = Depends(verified_twilio_params),
+    session: AsyncSession = Depends(get_session),
 ) -> TwilioStatusAck:
     """Apply one Twilio status callback to its DeliveryAttempt."""
-    params = await _form_params(request)
     # `SmsSid`/`SmsStatus` are Twilio's older aliases; both are still sent.
     twilio_sid = params.get("MessageSid") or params.get("SmsSid")
     raw_status = params.get("MessageStatus") or params.get("SmsStatus")
