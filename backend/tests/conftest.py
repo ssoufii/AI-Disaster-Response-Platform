@@ -5,6 +5,10 @@ dependency overridden, so no test needs a live PostgreSQL instance. Twilio is
 replaced wholesale in every test by the autouse ``twilio`` fixture below, and
 the Anthropic client is replaced by whichever test exercises generation — no
 test reaches either live API (CLAUDE.md, Testing).
+
+The same fixture installs a stand-in Twilio auth token, which
+``twilio_signed_headers`` uses to sign status callbacks the way Twilio does —
+the webhook refuses anything unsigned.
 """
 
 from collections.abc import AsyncGenerator
@@ -16,15 +20,33 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
+from twilio.request_validator import RequestValidator
 
 import app.models  # noqa: F401  registers every table on SQLModel.metadata
 from app.config import settings
 from app.db import get_session
 from app.main import app
 from app.services import delivery_service
+from app.webhooks.twilio_status import SIGNATURE_HEADER
 
 PUBLIC_BASE_URL = "https://disaster-response.test"
 TWILIO_PHONE_NUMBER = "+15550000000"
+# Not a credential: a stand-in token so tests can sign callbacks the way Twilio
+# does. The real one only ever comes from the environment.
+TWILIO_AUTH_TOKEN = "test-auth-token"
+STATUS_CALLBACK_URL = f"{PUBLIC_BASE_URL}{delivery_service.STATUS_CALLBACK_PATH}"
+
+
+def twilio_signed_headers(
+    params: dict[str, Any], *, token: str = TWILIO_AUTH_TOKEN, url: str = STATUS_CALLBACK_URL
+) -> dict[str, str]:
+    """Sign a status callback the way Twilio signs it.
+
+    The overrides exist so a test can sign with the wrong token or the wrong URL
+    and watch the endpoint refuse it.
+    """
+    signature = RequestValidator(token).compute_signature(url, params)
+    return {SIGNATURE_HEADER: signature}
 
 
 class SentMessage:
@@ -72,6 +94,7 @@ def twilio(monkeypatch: pytest.MonkeyPatch) -> FakeTwilio:
     # rather than the empty-string defaults a developer machine carries.
     monkeypatch.setattr(settings, "PUBLIC_BASE_URL", PUBLIC_BASE_URL)
     monkeypatch.setattr(settings, "TWILIO_PHONE_NUMBER", TWILIO_PHONE_NUMBER)
+    monkeypatch.setattr(settings, "TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN)
     return fake
 
 

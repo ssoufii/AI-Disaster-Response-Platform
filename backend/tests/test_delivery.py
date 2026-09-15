@@ -15,9 +15,17 @@ from httpx import AsyncClient
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.config import settings
 from app.models.delivery_attempt import DeliveryAttempt
 from app.services import content_generator
-from tests.conftest import PUBLIC_BASE_URL, TWILIO_PHONE_NUMBER, FakeTwilio
+from app.webhooks import twilio_status
+from tests.conftest import (
+    PUBLIC_BASE_URL,
+    TWILIO_AUTH_TOKEN,
+    TWILIO_PHONE_NUMBER,
+    FakeTwilio,
+    twilio_signed_headers,
+)
 
 SMS_TEXT = "Evacuate now. Go to Lincoln High School, 400 Oak St."
 
@@ -89,8 +97,10 @@ async def _dispatch_one_sms_household(
 
 
 async def _post_status(client: AsyncClient, **params: str) -> Any:
-    """POST a Twilio status callback exactly as Twilio does: form-encoded."""
-    return await client.post("/webhooks/twilio/status", data=params)
+    """POST a status callback exactly as Twilio does: form-encoded and signed."""
+    return await client.post(
+        "/webhooks/twilio/status", data=params, headers=twilio_signed_headers(params)
+    )
 
 
 async def _attempts(session: AsyncSession, alert_id: str) -> list[DeliveryAttempt]:
@@ -318,6 +328,141 @@ async def test_callback_missing_its_fields_is_ignored(client: AsyncClient) -> No
 
     assert response.status_code == 200
     assert response.json()["result"] == "ignored"
+
+
+# --- Webhook signature validation --------------------------------------------
+#
+# The valid-signature case is covered by every test above: `_post_status` signs
+# each callback the way Twilio does, and they only pass because the endpoint
+# accepts it. What follows is the refusal side.
+
+
+class RecordingLogger:
+    """Captures what the webhook logged, without a structlog round-trip."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def _record(self, level: str, event: str, **kwargs: Any) -> None:
+        self.calls.append((level, event, kwargs))
+
+    def warning(self, event: str, **kwargs: Any) -> None:
+        self._record("warning", event, **kwargs)
+
+    def error(self, event: str, **kwargs: Any) -> None:
+        self._record("error", event, **kwargs)
+
+
+async def _post_unsigned_status(client: AsyncClient, **params: str) -> Any:
+    return await client.post("/webhooks/twilio/status", data=params)
+
+
+async def _assert_attempt_untouched(session: AsyncSession, alert_id: str) -> None:
+    """The forged callback claimed `delivered`; the row must still say queued."""
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "queued"
+    assert attempt.completed_at is None
+
+
+async def test_callback_without_a_signature_is_refused(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+
+    response = await _post_unsigned_status(client, MessageSid=sid, MessageStatus="delivered")
+
+    assert response.status_code == 403
+    await _assert_attempt_untouched(session, alert_id)
+
+
+async def test_callback_signed_with_the_wrong_token_is_refused(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    params = {"MessageSid": twilio.messages.sent[0].sid, "MessageStatus": "delivered"}
+
+    response = await client.post(
+        "/webhooks/twilio/status",
+        data=params,
+        headers=twilio_signed_headers(params, token="not-our-auth-token"),
+    )
+
+    assert response.status_code == 403
+    await _assert_attempt_untouched(session, alert_id)
+
+
+async def test_callback_edited_after_signing_is_refused(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The signature covers the parameters, so a replayed-but-edited callback —
+    # a real "delivered" turned into a "failed" to provoke rerouting — fails.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    signed = {"MessageSid": twilio.messages.sent[0].sid, "MessageStatus": "sent"}
+
+    response = await client.post(
+        "/webhooks/twilio/status",
+        data=signed | {"MessageStatus": "delivered"},
+        headers=twilio_signed_headers(signed),
+    )
+
+    assert response.status_code == 403
+    await _assert_attempt_untouched(session, alert_id)
+
+
+async def test_signature_is_checked_against_the_public_callback_url(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Twilio signs the URL it posted to, which is the PUBLIC_BASE_URL callback we
+    # handed it — not the internal address the request arrives on.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    params = {"MessageSid": twilio.messages.sent[0].sid, "MessageStatus": "delivered"}
+
+    response = await client.post(
+        "/webhooks/twilio/status",
+        data=params,
+        headers=twilio_signed_headers(params, url="https://attacker.test/webhooks/twilio/status"),
+    )
+
+    assert response.status_code == 403
+    await _assert_attempt_untouched(session, alert_id)
+
+
+async def test_callback_is_refused_when_no_auth_token_is_configured(
+    client: AsyncClient,
+    session: AsyncSession,
+    twilio: FakeTwilio,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Fail closed: a deployment that forgot the token gets a shut endpoint, not
+    # an open one.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    monkeypatch.setattr(settings, "TWILIO_AUTH_TOKEN", "")
+
+    response = await _post_status(
+        client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="delivered"
+    )
+
+    assert response.status_code == 403
+    await _assert_attempt_untouched(session, alert_id)
+
+
+async def test_a_refused_callback_is_logged_without_the_auth_token(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _dispatch_one_sms_household(client)
+    recorder = RecordingLogger()
+    monkeypatch.setattr(twilio_status, "logger", recorder)
+
+    await _post_unsigned_status(
+        client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="delivered"
+    )
+
+    assert [(level, event) for level, event, _ in recorder.calls] == [
+        ("warning", "twilio_status.invalid_signature")
+    ]
+    assert TWILIO_AUTH_TOKEN not in json.dumps(recorder.calls[0][2])
 
 
 # --- The status snapshot -----------------------------------------------------
