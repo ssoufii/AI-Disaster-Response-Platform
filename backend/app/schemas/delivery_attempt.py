@@ -40,10 +40,14 @@ class HouseholdDeliveryStatus(BaseModel):
 class TwilioStatusAck(BaseModel):
     """What the status webhook did with a callback.
 
-    Always returned with a 200: Twilio retries anything else, and a callback we
-    cannot place is not one a retry will help. ``reason`` says why an ignored
-    callback was ignored, so the endpoint is debuggable from the outside during
-    an incident.
+    ``result`` is ``applied`` when the attempt was updated, ``duplicate`` when
+    Twilio had already reported this state and the callback changed nothing, and
+    ``ignored`` when the callback could not be placed at all.
+
+    Always returned with a 200: Twilio retries anything else, and neither a
+    callback we cannot place nor one we have already applied is helped by a
+    retry. ``reason`` says why an ignored callback was ignored, so the endpoint
+    is debuggable from the outside during an incident.
     """
 
     result: str

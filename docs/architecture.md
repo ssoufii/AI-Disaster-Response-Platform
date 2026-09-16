@@ -72,9 +72,20 @@ DeliveryAttempt
 - started_at
 - completed_at
 - error_reason (nullable)
+
+DeliveryStatusCallback  (one row per delivery state Twilio has already reported)
+- id
+- delivery_attempt_id
+- twilio_sid
+- status                 # the mapped DeliveryStatus — half of the dedupe key
+- raw_status             # Twilio's own word for it, kept for debugging only
+- received_at
+UNIQUE (twilio_sid, status)
 ```
 
-Relationships: `Alert 1—N DeliveryAttempt`, `Household 1—N DeliveryAttempt`, `Alert+Household 1—1 AlertContent` (regenerated per alert, not reused).
+Relationships: `Alert 1—N DeliveryAttempt`, `Household 1—N DeliveryAttempt`, `Alert+Household 1—1 AlertContent` (regenerated per alert, not reused), `DeliveryAttempt 1—N DeliveryStatusCallback`.
+
+`DeliveryStatusCallback` exists only to make the status webhook idempotent — Twilio retries, and this table is the record of what has already been applied. It is not part of the audit trail the console reads; that is `DeliveryAttempt`. See section 4.
 
 ---
 
@@ -171,9 +182,15 @@ This loop is what the resume line "re-routing failed deliveries to a fallback ch
 - A rejection is logged (`twilio_status.invalid_signature`, or `twilio_status.signature_unverifiable` when the token is missing) with the URL and whether a signature was present. Neither the auth token nor the presented signature is ever logged.
 - Looks the attempt up by the SID Twilio quotes back (`MessageSid`, or the legacy `SmsSid`), maps Twilio's status onto `DeliveryStatus`, sets `completed_at` on a terminal status, records `ErrorCode: ErrorMessage` as `error_reason` on a failure, and returns. Nothing slow belongs here — no Claude generation, no outbound send — because Twilio times the callback out and retries.
 - Status map: `accepted`/`queued`/`scheduled` → `queued`; `sending`/`sent` → `sending`; `delivered` → `delivered`; `undelivered`/`failed` → `failed`. `sent` is Twilio's "handed to the carrier" — still in flight, and never a receipt (Domain Rule 6). Voice's `ringing`, `in-progress`, `completed`, `no-answer` and `busy` arrive with issue #16 and are deliberately absent rather than guessed at.
-- An unknown SID or an unmapped status is logged and ignored **with a 200**: a 4xx only makes Twilio retry a callback that can never be placed. The response body (`{"result": "applied" | "ignored", ...}`) says which happened, so the endpoint is debuggable from the outside during an incident.
+- An unknown SID or an unmapped status is logged and ignored **with a 200**: a 4xx only makes Twilio retry a callback that can never be placed. The response body (`{"result": "applied" | "duplicate" | "ignored", ...}`) says which happened, so the endpoint is debuggable from the outside during an incident.
+- **The handler is idempotent, because Twilio retries.** Every state Twilio reports is recorded as a `DeliveryStatusCallback` keyed on `(twilio_sid, status)`; a callback whose state is already on record is a no-op that still answers **200** (`{"result": "duplicate"}`) and is logged as `twilio_status.duplicate_callback`. Without this, a routine retry would write the same status twice and — once rerouting lands (#12) — reroute the same failure twice, leaving two `DeliveryAttempt` rows for one fallback and corrupting exactly the audit trail Domain Rule 2 protects.
+  - The dedupe key is `(twilio_sid, status)`, not the SID alone: `queued` → `sending` → `delivered` are different callbacks about the same message and all three must apply.
+  - The `status` recorded is the **mapped** `DeliveryStatus`, not Twilio's raw string, because what must happen at most once is the *state change*. Twilio has two names for one outcome (`failed`/`undelivered`, `sending`/`sent`), and keying on the raw string would let the second name through as a fresh event — and fire a second reroute.
+  - Because the key is what has been *recorded* rather than the attempt's current status, a retry of an earlier state arriving after a later one (a delayed `sending` after `delivered`) is a duplicate, so it cannot walk the row backwards.
+  - The no-op returns before anything is written, which is what keeps a retried failure from also emitting a second WebSocket event (#10) or creating a second fallback attempt (#12) — none of that is downstream of the guard.
+  - Uniqueness is declared on the table, not only checked in the handler: two retries can arrive at once, and the lookup alone is a check-then-write both would pass. The handler's lookup keeps the ordinary retry a clean no-op; the constraint (caught as an `IntegrityError`, also answered `duplicate`) is what makes the race safe. The record is flushed in the same transaction as the status change it authorizes, so "this state was applied" and the application of it can never disagree.
 - The body is read with `urllib.parse.parse_qsl` rather than `request.form()` — Twilio posts `application/x-www-form-urlencoded`, so the standard library covers it and the service needs no multipart dependency. Signature validation checks exactly that params dict, and hands it to the handler, so the body is parsed once.
-- **Still missing:** idempotency under Twilio's retries (#9). Until it lands, a retried callback is applied twice.
+- **Still missing:** pushing the applied update onto the WebSocket layer (#10) and rerouting a terminal failure onto the next channel (#12). Both hang off the point where the update is applied, and both therefore inherit the idempotency guard above.
 
 ---
 
