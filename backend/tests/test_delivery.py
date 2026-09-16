@@ -12,11 +12,13 @@ from typing import Any
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.config import settings
 from app.models.delivery_attempt import DeliveryAttempt
+from app.models.delivery_status_callback import DeliveryStatusCallback
 from app.services import content_generator
 from app.webhooks import twilio_status
 from tests.conftest import (
@@ -101,6 +103,36 @@ async def _post_status(client: AsyncClient, **params: str) -> Any:
     return await client.post(
         "/webhooks/twilio/status", data=params, headers=twilio_signed_headers(params)
     )
+
+
+class RecordingLogger:
+    """Captures what the webhook logged, without a structlog round-trip.
+
+    ``bind`` mirrors structlog's: the bound context comes back merged into every
+    line the bound logger writes, which is how a test checks that a delivery-path
+    line carries its ``alert_id`` and ``household_id``.
+    """
+
+    def __init__(self, context: dict[str, Any] | None = None) -> None:
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.context = context or {}
+
+    def bind(self, **kwargs: Any) -> "RecordingLogger":
+        bound = RecordingLogger(self.context | kwargs)
+        bound.calls = self.calls  # one record, whether bound or not
+        return bound
+
+    def _record(self, level: str, event: str, **kwargs: Any) -> None:
+        self.calls.append((level, event, self.context | kwargs))
+
+    def info(self, event: str, **kwargs: Any) -> None:
+        self._record("info", event, **kwargs)
+
+    def warning(self, event: str, **kwargs: Any) -> None:
+        self._record("warning", event, **kwargs)
+
+    def error(self, event: str, **kwargs: Any) -> None:
+        self._record("error", event, **kwargs)
 
 
 async def _attempts(session: AsyncSession, alert_id: str) -> list[DeliveryAttempt]:
@@ -330,27 +362,196 @@ async def test_callback_missing_its_fields_is_ignored(client: AsyncClient) -> No
     assert response.json()["result"] == "ignored"
 
 
+# --- Webhook idempotency -----------------------------------------------------
+#
+# Twilio retries a callback it does not get a timely 200 for. A retry must
+# change nothing the first delivery of it already changed.
+
+
+async def _callbacks(session: AsyncSession, sid: str) -> list[DeliveryStatusCallback]:
+    return list(
+        (
+            await session.exec(
+                select(DeliveryStatusCallback).where(DeliveryStatusCallback.twilio_sid == sid)
+            )
+        ).all()
+    )
+
+
+async def test_a_retried_callback_does_not_apply_the_status_a_second_time(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+
+    first = await _post_status(client, MessageSid=sid, MessageStatus="delivered")
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    completed_at = attempt.completed_at
+
+    second = await _post_status(client, MessageSid=sid, MessageStatus="delivered")
+
+    assert first.json()["result"] == "applied"
+    # Still a 200: anything else and Twilio keeps retrying, compounding the
+    # problem the guard exists to solve.
+    assert second.status_code == 200
+    assert second.json()["result"] == "duplicate"
+    await session.refresh(attempt)
+    assert attempt.status == "delivered"
+    # The row was not written again — `completed_at` would have moved.
+    assert attempt.completed_at == completed_at
+
+
+async def test_a_retried_callback_creates_no_second_row_anywhere(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The duplicate returns before any side effect, which is what keeps a retried
+    # failure from producing a second WebSocket event (#10) or a second fallback
+    # attempt (#12) once those hang off this handler.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+
+    for _ in range(3):
+        await _post_status(
+            client, MessageSid=sid, MessageStatus="failed", ErrorCode="30006", ErrorMessage="Dead"
+        )
+
+    assert len(await _attempts(session, alert_id)) == 1
+    assert len(await _callbacks(session, sid)) == 1
+
+
+async def test_a_status_progression_for_one_sid_is_not_a_duplicate(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # sending → delivered is two real events about one message, not a retry. The
+    # key is (sid, status), not the sid alone.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+
+    sending = await _post_status(client, MessageSid=sid, MessageStatus="sending")
+    delivered = await _post_status(client, MessageSid=sid, MessageStatus="delivered")
+
+    assert [sending.json()["result"], delivered.json()["result"]] == ["applied", "applied"]
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "delivered"
+    assert attempt.completed_at is not None
+
+
+async def test_a_status_that_arrives_again_after_a_later_one_does_not_regress_the_attempt(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Twilio's retry of the `sending` callback can land after `delivered` has
+    # already been applied. Keying on what has been recorded — rather than on
+    # the attempt's current status — is what stops it walking the row backwards.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+    await _post_status(client, MessageSid=sid, MessageStatus="sending")
+    await _post_status(client, MessageSid=sid, MessageStatus="delivered")
+
+    late_retry = await _post_status(client, MessageSid=sid, MessageStatus="sending")
+
+    assert late_retry.json()["result"] == "duplicate"
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "delivered"
+
+
+async def test_twilios_two_names_for_one_failure_are_applied_once(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # `undelivered` and `failed` both mean the send failed, so the second is a
+    # second telling of one state change — and, once #12 lands, would otherwise
+    # be a second reroute. The recorded key is the mapped status for this reason.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+    await _post_status(
+        client,
+        MessageSid=sid,
+        MessageStatus="undelivered",
+        ErrorCode="30006",
+        ErrorMessage="Landline or unreachable carrier",
+    )
+
+    second = await _post_status(
+        client, MessageSid=sid, MessageStatus="failed", ErrorCode="30008", ErrorMessage="Unknown"
+    )
+
+    assert second.json()["result"] == "duplicate"
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.error_reason == "30006: Landline or unreachable carrier"
+
+
+async def test_the_same_status_for_a_different_message_is_not_a_duplicate(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Two households, one status: the guard keys on the SID too, or the second
+    # household's delivery would be silently swallowed as a repeat of the first.
+    zone_id = await _zone(client)
+    alert_id = await _alert(client, zone_id)
+    await _household(client, zone_id, "+15550100501")
+    await _household(client, zone_id, "+15550100502")
+    await client.post(f"/alerts/{alert_id}/dispatch")
+
+    for message in twilio.messages.sent:
+        response = await _post_status(client, MessageSid=message.sid, MessageStatus="delivered")
+        assert response.json()["result"] == "applied"
+
+    statuses = [attempt.status for attempt in await _attempts(session, alert_id)]
+    assert statuses == ["delivered", "delivered"]
+
+
+async def test_the_dedupe_key_is_enforced_by_the_database(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Two retries can arrive at the same moment, and the handler's lookup alone
+    # is a check-then-write both would pass. The constraint is the guarantee.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+    await _post_status(client, MessageSid=sid, MessageStatus="delivered")
+    attempt = (await _attempts(session, alert_id))[0]
+
+    session.add(
+        DeliveryStatusCallback(
+            delivery_attempt_id=attempt.id,
+            twilio_sid=sid,
+            status="delivered",
+            raw_status="delivered",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await session.flush()
+    await session.rollback()
+
+
+async def test_a_duplicate_callback_is_logged_against_its_alert_and_household(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An operator watching a dispatch needs retries to be visible, and every
+    # delivery-path line carries alert_id and household_id (CLAUDE.md, Logging).
+    alert_id, household_id = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+    await _post_status(client, MessageSid=sid, MessageStatus="delivered")
+    recorder = RecordingLogger()
+    monkeypatch.setattr(twilio_status, "logger", recorder)
+
+    await _post_status(client, MessageSid=sid, MessageStatus="delivered")
+
+    assert [(level, event) for level, event, _ in recorder.calls] == [
+        ("info", "twilio_status.duplicate_callback")
+    ]
+    context = recorder.calls[0][2]
+    assert context["alert_id"] == alert_id
+    assert context["household_id"] == household_id
+    assert context["status"] == "delivered"
+
+
 # --- Webhook signature validation --------------------------------------------
 #
 # The valid-signature case is covered by every test above: `_post_status` signs
 # each callback the way Twilio does, and they only pass because the endpoint
 # accepts it. What follows is the refusal side.
-
-
-class RecordingLogger:
-    """Captures what the webhook logged, without a structlog round-trip."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict[str, Any]]] = []
-
-    def _record(self, level: str, event: str, **kwargs: Any) -> None:
-        self.calls.append((level, event, kwargs))
-
-    def warning(self, event: str, **kwargs: Any) -> None:
-        self._record("warning", event, **kwargs)
-
-    def error(self, event: str, **kwargs: Any) -> None:
-        self._record("error", event, **kwargs)
 
 
 async def _post_unsigned_status(client: AsyncClient, **params: str) -> Any:

@@ -17,7 +17,12 @@ single row is read. Without it, anyone who found the URL could post forged
 delivery state into the audit trail — or, once #12 lands, trigger rerouting
 against real households.
 
-Idempotency under Twilio's retries (#9) is still missing.
+The handler is also idempotent, because Twilio retries any callback it does not
+get a timely 200 for. Each state Twilio reports is recorded as a
+``DeliveryStatusCallback`` keyed on ``(twilio_sid, status)``; a callback whose
+state is already on record is a no-op that still answers 200, so a retry cannot
+write the same status twice or — once #12 lands — reroute the same failure
+twice.
 """
 
 from datetime import UTC, datetime
@@ -25,6 +30,7 @@ from urllib.parse import parse_qsl
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from twilio.request_validator import RequestValidator
@@ -32,6 +38,7 @@ from twilio.request_validator import RequestValidator
 from app.config import settings
 from app.db import get_session
 from app.models.delivery_attempt import DeliveryAttempt
+from app.models.delivery_status_callback import DeliveryStatusCallback
 from app.models.enums import DeliveryStatus
 from app.schemas.delivery_attempt import TwilioStatusAck
 from app.services.delivery_service import status_callback_url
@@ -159,6 +166,20 @@ async def twilio_status(
         )
         return TwilioStatusAck(result="ignored", reason=f"unmapped status {raw_status}")
 
+    if not await _record_callback(session, attempt, twilio_sid, status, raw_status):
+        # Already applied. Returning before anything is written is what makes
+        # the retry harmless: no second status write, no second WebSocket event
+        # (#10), and no second fallback attempt row (#12), because none of that
+        # is downstream of this line.
+        log.info(
+            "twilio_status.duplicate_callback",
+            twilio_sid=twilio_sid,
+            channel=attempt.channel,
+            attempt_number=attempt.attempt_number,
+            status=status.value,
+        )
+        return TwilioStatusAck(result="duplicate", status=status)
+
     attempt.status = status.value
     if status in TERMINAL_STATUSES:
         attempt.completed_at = datetime.now(UTC)
@@ -176,6 +197,56 @@ async def twilio_status(
         status=attempt.status,
     )
     return TwilioStatusAck(result="applied", status=status)
+
+
+async def _record_callback(
+    session: AsyncSession,
+    attempt: DeliveryAttempt,
+    twilio_sid: str,
+    status: DeliveryStatus,
+    raw_status: str,
+) -> bool:
+    """Claim this ``(twilio_sid, status)`` state, or report it already claimed.
+
+    Returns ``True`` when the caller should go on to apply the update, ``False``
+    when Twilio has already told us this state and the callback is a retry.
+
+    The row is only flushed here, not committed: it lands in the same
+    transaction as the status change it authorizes, so the record of "this state
+    was applied" and the application of it can never disagree.
+
+    Both halves of the check are needed. The lookup is what makes the ordinary
+    case — a retry minutes later — a clean no-op. The unique constraint is what
+    makes it correct when two retries arrive together, since the lookup alone is
+    a check-then-write that both requests would pass.
+    """
+    already_applied = (
+        await session.exec(
+            select(DeliveryStatusCallback).where(
+                DeliveryStatusCallback.twilio_sid == twilio_sid,
+                DeliveryStatusCallback.status == status.value,
+            )
+        )
+    ).first()
+    if already_applied is not None:
+        return False
+
+    session.add(
+        DeliveryStatusCallback(
+            delivery_attempt_id=attempt.id,
+            twilio_sid=twilio_sid,
+            status=status.value,
+            raw_status=raw_status,
+        )
+    )
+    try:
+        await session.flush()
+    except IntegrityError:
+        # The concurrent retry that got there first. Its transaction applies the
+        # status; ours drops everything it staged and answers 200.
+        await session.rollback()
+        return False
+    return True
 
 
 def _error_reason(params: dict[str, str]) -> str | None:
