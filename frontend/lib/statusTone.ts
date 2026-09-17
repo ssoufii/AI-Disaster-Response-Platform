@@ -1,0 +1,79 @@
+/**
+ * What colour a household's row is, and why.
+ *
+ * The four tones are fixed by CLAUDE.md and mean specific things, so they are
+ * decided here once rather than at each call site:
+ *
+ * - **green** — delivered, or confirmed by a human. Nothing to do.
+ * - **amber** — this channel failed and the household is being retried on the
+ *   next one. Still in hand.
+ * - **red** — every channel is exhausted. A person has to pick this up.
+ * - **grey** — in flight, or not attempted yet. Nothing has happened.
+ *
+ * Red is read from the household's own status rather than from the attempt,
+ * because "unreached" is a statement about the household after its whole
+ * fallback chain ran out (#13), not about any single attempt.
+ */
+
+import type { HouseholdRow } from "@/lib/consoleState";
+
+export type StatusTone = "green" | "amber" | "red" | "grey";
+
+const FAILED_STATUSES = new Set(["failed", "no_answer"]);
+
+export function statusTone(row: HouseholdRow): StatusTone {
+  if (row.last_known_status === "unreached") {
+    return "red";
+  }
+  if (row.status === "delivered" || row.status === "confirmed_received") {
+    return "green";
+  }
+  if (row.status !== null && FAILED_STATUSES.has(row.status)) {
+    return "amber";
+  }
+  return "grey";
+}
+
+export const TONE_CLASSES: Record<StatusTone, string> = {
+  green: "border-emerald-300 bg-emerald-50 text-emerald-900",
+  amber: "border-amber-300 bg-amber-50 text-amber-900",
+  red: "border-red-300 bg-red-50 text-red-900",
+  grey: "border-slate-300 bg-slate-100 text-slate-700",
+};
+
+export const TONE_DOT_CLASSES: Record<StatusTone, string> = {
+  green: "bg-emerald-500",
+  amber: "bg-amber-500",
+  red: "bg-red-500",
+  grey: "bg-slate-400",
+};
+
+const STATUS_LABELS: Record<string, string> = {
+  queued: "Queued",
+  sending: "Sending",
+  delivered: "Delivered",
+  failed: "Failed",
+  no_answer: "No answer",
+  confirmed_received: "Confirmed received",
+};
+
+export function statusLabel(row: HouseholdRow): string {
+  if (row.last_known_status === "unreached") {
+    return "Unreached — needs follow-up";
+  }
+  if (row.status === null) {
+    return "Not attempted";
+  }
+  return STATUS_LABELS[row.status] ?? row.status;
+}
+
+const CHANNEL_LABELS: Record<string, string> = {
+  sms: "SMS",
+  voice: "Voice",
+  video: "Video / ASL",
+  whatsapp: "WhatsApp",
+};
+
+export function channelLabel(channel: string): string {
+  return CHANNEL_LABELS[channel] ?? channel;
+}

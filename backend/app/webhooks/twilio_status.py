@@ -41,6 +41,7 @@ from app.models.delivery_attempt import DeliveryAttempt
 from app.models.delivery_status_callback import DeliveryStatusCallback
 from app.models.enums import DeliveryStatus
 from app.schemas.delivery_attempt import TwilioStatusAck
+from app.services import dispatcher_ws
 from app.services.delivery_service import status_callback_url
 
 router = APIRouter(prefix="/webhooks/twilio", tags=["webhooks"])
@@ -168,9 +169,9 @@ async def twilio_status(
 
     if not await _record_callback(session, attempt, twilio_sid, status, raw_status):
         # Already applied. Returning before anything is written is what makes
-        # the retry harmless: no second status write, no second WebSocket event
-        # (#10), and no second fallback attempt row (#12), because none of that
-        # is downstream of this line.
+        # the retry harmless: no second status write, no second WebSocket event,
+        # and no second fallback attempt row (#12), because none of that is
+        # downstream of this line.
         log.info(
             "twilio_status.duplicate_callback",
             twilio_sid=twilio_sid,
@@ -196,6 +197,10 @@ async def twilio_status(
         attempt_number=attempt.attempt_number,
         status=attempt.status,
     )
+    # After the commit, so the consoles are never shown a state the database has
+    # not accepted. In-process and non-blocking, so it does not slow the 200
+    # down — nothing here waits on Twilio, Claude or the network.
+    await dispatcher_ws.broadcast_delivery_update(attempt)
     return TwilioStatusAck(result="applied", status=status)
 
 
