@@ -17,6 +17,10 @@ Three things shape this module:
 3. **One household's failure is one failed row.** A Twilio error is recorded on
    that household's attempt and the dispatch continues down the zone; it is
    never allowed to abort the other households' sends.
+4. **Every state a row reaches is broadcast.** A console open when a dispatch
+   starts learns about the new attempt here rather than waiting for Twilio's
+   first callback — and a send Twilio refuses outright never gets a callback at
+   all, so without this its failure would never reach the console.
 
 Rerouting a terminal failure onto the household's next channel is deliberately
 *not* here yet — it is triggered from the status webhook (issue #12). Until then
@@ -41,6 +45,7 @@ from app.models.alert_content import AlertContent
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import Channel, DeliveryStatus
 from app.models.household import Household
+from app.services import dispatcher_ws
 
 logger = structlog.get_logger(__name__)
 
@@ -156,6 +161,10 @@ async def _send_sms(
     session.add(attempt)
     # Committed before the send: the row is the record that we tried.
     await session.commit()
+    # The console shows the household as in flight from here, not from Twilio's
+    # first callback — a grid that lags the dispatch it is watching is exactly
+    # the staleness this console exists to avoid.
+    await dispatcher_ws.broadcast_delivery_update(attempt)
 
     try:
         message = await get_client().messages.create_async(
@@ -180,6 +189,9 @@ async def _send_sms(
             error_type=type(exc).__name__,
             error=str(exc),
         )
+        # Twilio never accepted this message, so it will never call back about
+        # it. This broadcast is the only way the failure reaches the console.
+        await dispatcher_ws.broadcast_delivery_update(attempt)
         return attempt
 
     attempt.twilio_sid = message.sid

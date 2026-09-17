@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from app.api import alerts, households, zones
 from app.exceptions import NotFoundError
 from app.logging_config import configure_logging
+from app.services import dispatcher_ws
 from app.webhooks import twilio_status
 
 configure_logging()
@@ -16,6 +17,8 @@ app.include_router(zones.router)
 app.include_router(households.router)
 app.include_router(alerts.router)
 app.include_router(twilio_status.router)
+# WS /ws/alerts/{alert_id} — the dispatcher console's live feed.
+app.include_router(dispatcher_ws.router)
 
 
 @app.exception_handler(NotFoundError)

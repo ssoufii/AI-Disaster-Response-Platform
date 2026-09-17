@@ -187,10 +187,11 @@ This loop is what the resume line "re-routing failed deliveries to a fallback ch
   - The dedupe key is `(twilio_sid, status)`, not the SID alone: `queued` → `sending` → `delivered` are different callbacks about the same message and all three must apply.
   - The `status` recorded is the **mapped** `DeliveryStatus`, not Twilio's raw string, because what must happen at most once is the *state change*. Twilio has two names for one outcome (`failed`/`undelivered`, `sending`/`sent`), and keying on the raw string would let the second name through as a fresh event — and fire a second reroute.
   - Because the key is what has been *recorded* rather than the attempt's current status, a retry of an earlier state arriving after a later one (a delayed `sending` after `delivered`) is a duplicate, so it cannot walk the row backwards.
-  - The no-op returns before anything is written, which is what keeps a retried failure from also emitting a second WebSocket event (#10) or creating a second fallback attempt (#12) — none of that is downstream of the guard.
+  - The no-op returns before anything is written, which is what keeps a retried failure from also pushing a second WebSocket event to the console or creating a second fallback attempt (#12) — none of that is downstream of the guard.
   - Uniqueness is declared on the table, not only checked in the handler: two retries can arrive at once, and the lookup alone is a check-then-write both would pass. The handler's lookup keeps the ordinary retry a clean no-op; the constraint (caught as an `IntegrityError`, also answered `duplicate`) is what makes the race safe. The record is flushed in the same transaction as the status change it authorizes, so "this state was applied" and the application of it can never disagree.
 - The body is read with `urllib.parse.parse_qsl` rather than `request.form()` — Twilio posts `application/x-www-form-urlencoded`, so the standard library covers it and the service needs no multipart dependency. Signature validation checks exactly that params dict, and hands it to the handler, so the body is parsed once.
-- **Still missing:** pushing the applied update onto the WebSocket layer (#10) and rerouting a terminal failure onto the next channel (#12). Both hang off the point where the update is applied, and both therefore inherit the idempotency guard above.
+- An applied update is pushed to the alert's WebSocket subscribers immediately afterwards, which is what makes the console live. The broadcast happens **after** the commit, so a console is never shown a state the database has not accepted, and it is in-process and non-blocking, so it does not slow the 200 down.
+- **Still missing:** rerouting a terminal failure onto the next channel (#12). It hangs off the point where the update is applied, and therefore inherits the idempotency guard above.
 
 ---
 
@@ -248,6 +249,16 @@ Key endpoints:
 }
 ```
 
+**Implementation notes** (`backend/app/services/dispatcher_ws.py`, `backend/app/schemas/ws_events.py`):
+- The schema lives in `app/schemas/ws_events.py`, and is one of three things that move together: `frontend/lib/types.ts` and this document are the other two.
+- Subscribers are held per `alert_id` in an in-process `ConnectionManager`. The socket is a **diff channel, never the source of truth** — nothing is replayed to a late subscriber, because the console has already read `GET /alerts/{id}/status` and the next event applies on top of it.
+- **Every event is applicable standalone.** It carries the household, channel, attempt number and status in full rather than a delta, so a console that connected mid-dispatch, or reconnected after a drop (#11), lands on the same row as one that saw every earlier event.
+- `fallback_triggered`/`fallback_channel` are in the contract from the start and are `false`/`null` until rerouting lands (#12). The console reads them on every event rather than having to handle their sudden appearance.
+- A send to a dead socket drops that subscriber and never raises. Broadcasting happens on the webhook's path, and a browser tab that closed mid-dispatch must not turn into a 500 on a Twilio callback.
+- Events are emitted from two places, both after their commit: the status webhook when a callback is applied, and `delivery_service` when an attempt is first committed as `queued` and if the send is refused outright. The second matters because a send Twilio never accepted gets no callback, so without it that failure would never reach the console at all.
+- A single instance is assumed. A second uvicorn worker would keep its own registry and its consoles would not see these events; scaling the socket layer out is out of scope.
+- `household_unreached` (#13), `dispatch_started` and `dispatch_complete` are part of the contract but are not emitted yet. The console ignores event types it does not recognise, so they can land without breaking a console that predates them.
+
 ---
 
 ## 6. Next.js Dispatcher Console
@@ -256,17 +267,32 @@ Key endpoints:
 /app
   alerts/[id]/page.tsx     # main live console
   components/
+    AlertConsole.tsx         # client half: owns the reducer and the socket
     HouseholdStatusGrid.tsx  # live grid: household x channel x status
     AlertComposer.tsx        # form to draft + dispatch a new alert
     DeliveryTimeline.tsx     # per-household attempt history incl. fallback events
   hooks/
     useAlertSocket.ts        # WebSocket hook, reconnect logic, message reducer
+  lib/
+    types.ts                 # snapshot + WS event types, mirrored from the backend schemas
+    consoleState.ts          # the reducer: rows keyed by household_id
+    statusTone.ts            # status → green / amber / red / grey
+    api.ts, env.ts           # GET /alerts/{id}/status; NEXT_PUBLIC_* URLs
 ```
 
 - On mount: `GET /alerts/{id}/status` for initial snapshot, then open WebSocket for live diffs — avoids a blank screen while the socket connects.
 - State: reducer keyed by `household_id` so incoming `delivery_update` events patch just one row instead of re-rendering the whole grid.
 - Visually distinguish: delivered (green), failed→rerouted (amber, shows "SMS failed → retrying via Voice"), unreached after all fallbacks (red, needs human follow-up).
 - Reconnect with backoff if the socket drops — a dispatcher console silently going stale during a disaster is the worst failure mode.
+
+**Implementation notes:**
+- `app/alerts/[id]/page.tsx` is a **server component**, and that is what makes the snapshot-before-socket rule structural rather than a matter of ordering effects: the grid is rendered on the server and shipped as HTML, and the socket opens underneath a console that is already showing every household. Its failure paths render a panel saying the console cannot reach the dispatch service — never a blank page, because a dispatcher has to be able to tell "nothing is happening" from "this console is broken".
+- `AlertConsole.tsx` is the `"use client"` boundary. It seeds `useReducer` from the snapshot it was handed, so its first client paint is the same grid the server rendered.
+- `lib/consoleState.ts` holds rows in a `Record<household_id, HouseholdRow>` plus a separate `order` array. A `delivery_update` replaces one entry and leaves every other row object identical, so the memoised rows around it do not re-render — on a zone dispatch that is the difference between one row updating and hundreds re-rendering per Twilio callback. `order` is kept apart so a patch never reshuffles the grid.
+- An event for a household the snapshot did not contain is dropped: it joined the zone after the page loaded, and a reconnect resync (#11) is what picks it up.
+- `lib/statusTone.ts` is the single place the four colours are decided. Red is read from the household's `last_known_status`, not from any attempt, because "unreached" is a statement about the household after its whole fallback chain ran out (#13).
+- `useAlertSocket.ts` holds its handler in a ref so a new inline callback per render does not tear the socket down, and ignores frames it cannot parse or whose `type` it does not know. Reconnect, backoff and the "connection lost" banner are #11's; the hook stops at opening the socket and delivering what arrives on it.
+- Reads `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` as literal `process.env.*` member accesses, the form Next inlines at build time.
 
 ---
 
