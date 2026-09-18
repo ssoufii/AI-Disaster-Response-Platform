@@ -55,8 +55,8 @@ export interface AlertStatusSnapshot {
  * One household's delivery state changed.
  *
  * Carries the whole state rather than a delta, so a console that connected
- * mid-dispatch — or reconnected after a drop (#11) — can apply it without
- * having seen anything before it.
+ * mid-dispatch — or reconnected after a drop — can apply it without having
+ * seen anything before it.
  */
 export interface DeliveryUpdateEvent {
   type: "delivery_update";

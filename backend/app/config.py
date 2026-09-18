@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://localhost/disaster_response"
     PUBLIC_BASE_URL: str = ""
 
+    # Where the dispatcher console is served from. The console is a separate
+    # origin by design (that is what NEXT_PUBLIC_API_URL is for), so its
+    # browser-side resync of GET /alerts/{id}/status needs this endpoint to say
+    # the origin is allowed — otherwise a console that lost its socket can never
+    # prove it is current again and sits behind a "reconnecting" banner forever.
+    # Comma-separated; listed explicitly rather than wildcarded.
+    CONSOLE_ORIGINS: str = "http://localhost:3000"
+
+    @property
+    def console_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.CONSOLE_ORIGINS.split(",") if origin.strip()]
+
 
 @lru_cache
 def get_settings() -> Settings:

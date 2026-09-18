@@ -43,7 +43,10 @@ export interface ConsoleState {
   rows: Record<string, HouseholdRow>;
 }
 
-export type ConsoleAction = { type: "delivery_update"; event: DeliveryUpdateEvent };
+export type ConsoleAction =
+  | { type: "delivery_update"; event: DeliveryUpdateEvent }
+  /** A reconnect re-read `GET /alerts/{id}/status`; see `consoleReducer`. */
+  | { type: "snapshot_resync"; snapshot: AlertStatusSnapshot };
 
 function rowFromSnapshot(household: HouseholdDeliveryStatus): HouseholdRow {
   const attempt = household.current_attempt;
@@ -76,12 +79,22 @@ export function initialConsoleState(snapshot: AlertStatusSnapshot): ConsoleState
 }
 
 export function consoleReducer(state: ConsoleState, action: ConsoleAction): ConsoleState {
+  // After an outage the server's snapshot is the only honest account of where
+  // every household stands: the events that arrived while the socket was down
+  // are gone and nothing replays them. So it replaces the rows wholesale rather
+  // than merging into them — including households that joined the zone while
+  // this page was loaded, which is how a dropped `delivery_update` below is
+  // eventually made good.
+  if (action.type === "snapshot_resync") {
+    return initialConsoleState(action.snapshot);
+  }
+
   const { event } = action;
   const current = state.rows[event.household_id];
 
   // A household the snapshot did not contain: it joined the zone after this
   // page loaded. Dropping the event keeps the grid consistent with the snapshot
-  // it was built from; a reconnect resync (#11) is what picks the household up.
+  // it was built from; a reconnect resync is what picks the household up.
   if (current === undefined) {
     return state;
   }

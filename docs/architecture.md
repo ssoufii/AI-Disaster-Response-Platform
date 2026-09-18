@@ -268,16 +268,19 @@ Key endpoints:
   alerts/[id]/page.tsx     # main live console
   components/
     AlertConsole.tsx         # client half: owns the reducer and the socket
+    ConnectionBanner.tsx     # "connection lost / reconnecting" while the socket is down
     HouseholdStatusGrid.tsx  # live grid: household x channel x status
     AlertComposer.tsx        # form to draft + dispatch a new alert
     DeliveryTimeline.tsx     # per-household attempt history incl. fallback events
   hooks/
-    useAlertSocket.ts        # WebSocket hook, reconnect logic, message reducer
+    useAlertSocket.ts        # React wrapper: frame parsing + connection state
   lib/
+    alertSocketController.ts # connect / backoff / reconnect / resync, outside React
     types.ts                 # snapshot + WS event types, mirrored from the backend schemas
     consoleState.ts          # the reducer: rows keyed by household_id
     statusTone.ts            # status → green / amber / red / grey
     api.ts, env.ts           # GET /alerts/{id}/status; NEXT_PUBLIC_* URLs
+  tests/                     # node --test (`npm test`); no test framework installed
 ```
 
 - On mount: `GET /alerts/{id}/status` for initial snapshot, then open WebSocket for live diffs — avoids a blank screen while the socket connects.
@@ -289,9 +292,15 @@ Key endpoints:
 - `app/alerts/[id]/page.tsx` is a **server component**, and that is what makes the snapshot-before-socket rule structural rather than a matter of ordering effects: the grid is rendered on the server and shipped as HTML, and the socket opens underneath a console that is already showing every household. Its failure paths render a panel saying the console cannot reach the dispatch service — never a blank page, because a dispatcher has to be able to tell "nothing is happening" from "this console is broken".
 - `AlertConsole.tsx` is the `"use client"` boundary. It seeds `useReducer` from the snapshot it was handed, so its first client paint is the same grid the server rendered.
 - `lib/consoleState.ts` holds rows in a `Record<household_id, HouseholdRow>` plus a separate `order` array. A `delivery_update` replaces one entry and leaves every other row object identical, so the memoised rows around it do not re-render — on a zone dispatch that is the difference between one row updating and hundreds re-rendering per Twilio callback. `order` is kept apart so a patch never reshuffles the grid.
-- An event for a household the snapshot did not contain is dropped: it joined the zone after the page loaded, and a reconnect resync (#11) is what picks it up.
+- An event for a household the snapshot did not contain is dropped: it joined the zone after the page loaded, and a reconnect resync is what picks it up.
 - `lib/statusTone.ts` is the single place the four colours are decided. Red is read from the household's `last_known_status`, not from any attempt, because "unreached" is a statement about the household after its whole fallback chain ran out (#13).
-- `useAlertSocket.ts` holds its handler in a ref so a new inline callback per render does not tear the socket down, and ignores frames it cannot parse or whose `type` it does not know. Reconnect, backoff and the "connection lost" banner are #11's; the hook stops at opening the socket and delivering what arrives on it.
+- `useAlertSocket.ts` holds its handlers in a ref so a new inline callback per render does not tear the socket down, ignores frames it cannot parse or whose `type` it does not know, and returns the connection state the banner renders from. The lifecycle underneath it lives in `lib/alertSocketController.ts`.
+- `lib/alertSocketController.ts` owns connect → drop → backoff → reconnect → resync, deliberately outside React and outside the browser: the socket, the snapshot fetch and the timer all arrive as arguments, which is what makes the backoff schedule and the resync observable in `frontend/tests/` without a DOM or a live server. Three rules it exists to enforce:
+  - **A drop is reported before the retry is waited out**, not after. At the tail of the schedule "after" is half a minute of a console that looks fine and is not.
+  - **Backoff is 1s, 2s, 4s, 8s, 16s, then 30s from there on, forever.** Capped rather than given up on — a long outage is exactly when the console must not quietly stop trying, so the banner persists through every failed attempt instead of clearing on an *attempt*.
+  - **A reopened socket is not `live` until it has resynced.** Nothing replays the events missed during an outage, so the controller re-fetches `GET /alerts/{id}/status`, reseeds the reducer from it (`snapshot_resync`), and only then clears the banner. Frames that arrive while that fetch is in flight are held and applied *after* the snapshot, or the older snapshot would land on top of newer state. A resync that fails drops the connection back into the retry loop rather than clearing the banner.
+- That resync is the console's **first browser-side read of the API** — the load snapshot is fetched by a server component and a WebSocket handshake is not subject to CORS, so nothing before it was. The console is its own origin by design (that is what `NEXT_PUBLIC_API_URL` is for), so `main.py` adds `CORSMiddleware` over `CONSOLE_ORIGINS` (comma-separated, default `http://localhost:3000`), GET only, named origins, no wildcard and no credentials. Without it the resync is blocked and the banner can never clear, which is the exact "console stuck looking broken" state the story exists to prevent. Auth on these routes is #20's.
+- The frontend suite runs on the Node test runner (`npm test` in `frontend/`) — no test framework is a dependency, and the injected socket/fetch/timer are why none is needed.
 - Reads `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` as literal `process.env.*` member accesses, the form Next inlines at build time.
 
 ---
@@ -317,6 +326,7 @@ TWILIO_PHONE_NUMBER=
 TWILIO_WHATSAPP_NUMBER=
 DATABASE_URL=
 PUBLIC_BASE_URL=   # for Twilio webhook callbacks
+CONSOLE_ORIGINS=   # comma-separated console origins allowed to read the API from the browser
 ```
 
 ---
