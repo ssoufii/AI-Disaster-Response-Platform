@@ -246,6 +246,7 @@ TWILIO_PHONE_NUMBER=
 TWILIO_WHATSAPP_NUMBER=
 DATABASE_URL=
 PUBLIC_BASE_URL=          # ngrok URL in dev; required for Twilio callbacks
+CONSOLE_ORIGINS=          # comma-separated console origins allowed to read the API from the browser
 NEXT_PUBLIC_API_URL=
 NEXT_PUBLIC_WS_URL=
 ```
