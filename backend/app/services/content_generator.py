@@ -79,7 +79,7 @@ def get_client() -> AsyncAnthropic:
     return AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 
-def _prompt_inputs(alert: Alert, household: Household) -> dict[str, Any]:
+def _prompt_inputs(alert: Alert, household: Household, channel: str) -> dict[str, Any]:
     """The per-household half of the prompt, as structured fields.
 
     Facts travel as a JSON object, not prose: a shelter address Claude is asked
@@ -92,7 +92,7 @@ def _prompt_inputs(alert: Alert, household: Household) -> dict[str, Any]:
         "target_language": household.language,
         "literacy_level": household.literacy_level,
         "accessibility_needs": household.accessibility_needs,
-        "channel": household.preferred_channel,
+        "channel": channel,
         "facts": alert.facts,
     }
 
@@ -107,7 +107,9 @@ def _is_rate_limited(exc: Exception) -> bool:
     return getattr(exc, "status_code", None) in RATE_LIMIT_STATUS_CODES
 
 
-async def generate(alert: Alert, household: Household) -> GeneratedAlertContent:
+async def generate(
+    alert: Alert, household: Household, channel: str | None = None
+) -> GeneratedAlertContent:
     """Generate alert content for one household, or fall back to a template.
 
     Calls Claude, retrying once if the call fails or the response does not
@@ -117,15 +119,22 @@ async def generate(alert: Alert, household: Household) -> GeneratedAlertContent:
     warning level so it is visible to whoever is watching logs during the
     incident. Never raises: an undeliverable household is a worse outcome than
     a generic warning.
+
+    ``channel`` defaults to the household's preferred one. A fallback reroute
+    (#12) passes the channel it is rerouting *onto*, because the channel shapes
+    the content — what reads well as an SMS is not what a voice call should say
+    — and by then the household's preference is precisely the channel that
+    failed.
     """
     log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
+    channel = channel or household.preferred_channel
     attempt = 0
     backoff = INITIAL_BACKOFF_SECONDS
 
     while True:
         attempt += 1
         try:
-            return await _generate_once(alert, household)
+            return await _generate_once(alert, household, channel)
         except Exception as exc:
             # Deliberately broad: a validation failure, a timeout, and a
             # transport error all mean the same thing to this household — no
@@ -198,7 +207,7 @@ async def generate_for_zone(
     return list(contents)
 
 
-async def _generate_once(alert: Alert, household: Household) -> GeneratedAlertContent:
+async def _generate_once(alert: Alert, household: Household, channel: str) -> GeneratedAlertContent:
     """One Claude call, validated strictly.
 
     Raises ``ContentGenerationError`` if the response does not validate against
@@ -221,7 +230,7 @@ async def _generate_once(alert: Alert, household: Household) -> GeneratedAlertCo
             {
                 "role": "user",
                 "content": json.dumps(
-                    _prompt_inputs(alert, household), sort_keys=True, ensure_ascii=False
+                    _prompt_inputs(alert, household, channel), sort_keys=True, ensure_ascii=False
                 ),
             }
         ],

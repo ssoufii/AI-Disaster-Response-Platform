@@ -307,7 +307,7 @@ async def test_event_carries_enough_state_to_be_applied_standalone(
     }
     assert event["channel"] == "sms"
     assert event["attempt_number"] == 1
-    # Rerouting arrives with #12; until then the contract's fields are present
+    # Nothing was rerouted here, so the contract's fallback fields are present
     # and empty rather than absent.
     assert event["fallback_triggered"] is False
     assert event["fallback_channel"] is None
@@ -350,6 +350,59 @@ async def test_an_unplaceable_callback_pushes_nothing(
     await _post_status(client, MessageSid="SMnot-ours", MessageStatus="delivered")
 
     assert console.sent == []
+
+
+# --- Broadcast from a fallback reroute ----------------------------------------
+
+
+async def test_a_reroute_tells_the_console_what_failed_and_where_it_is_going(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    # One event carrying both halves is what lets the console write
+    # "SMS failed → retrying via Voice" (#14) rather than flipping a status.
+    alert_id, household_id = await _dispatch(client)
+    console = await _watch(manager, alert_id)
+    sid = twilio.messages.sent[0].sid
+
+    await _post_status(client, MessageSid=sid, MessageStatus="failed")
+
+    reroute = next(event for event in console.sent if event["fallback_triggered"])
+    assert reroute["household_id"] == household_id
+    assert reroute["channel"] == Channel.SMS.value
+    assert reroute["status"] == DeliveryStatus.FAILED.value
+    assert reroute["attempt_number"] == 1
+    assert reroute["fallback_channel"] == Channel.VOICE.value
+
+
+async def test_the_new_attempt_announces_itself_like_any_other(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    # The console learns the voice attempt exists from its own event, so a
+    # console that connects between the two still renders attempt 2 correctly.
+    alert_id, _ = await _dispatch(client)
+    console = await _watch(manager, alert_id)
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="failed")
+
+    assert [
+        (event["channel"], event["attempt_number"], event["status"], event["fallback_triggered"])
+        for event in console.sent
+    ] == [
+        ("sms", 1, DeliveryStatus.FAILED.value, False),
+        ("sms", 1, DeliveryStatus.FAILED.value, True),
+        ("voice", 2, DeliveryStatus.QUEUED.value, False),
+    ]
+
+
+async def test_a_delivered_attempt_never_announces_a_fallback(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch(client)
+    console = await _watch(manager, alert_id)
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="delivered")
+
+    assert [event["fallback_triggered"] for event in console.sent] == [False]
 
 
 # --- Broadcast from the dispatch itself --------------------------------------

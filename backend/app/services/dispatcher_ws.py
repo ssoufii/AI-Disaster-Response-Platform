@@ -86,7 +86,12 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-async def broadcast_delivery_update(attempt: DeliveryAttempt) -> None:
+async def broadcast_delivery_update(
+    attempt: DeliveryAttempt,
+    *,
+    fallback_triggered: bool = False,
+    fallback_channel: Channel | None = None,
+) -> None:
     """Push one attempt's current state to the consoles watching its alert.
 
     Takes the attempt row rather than loose fields so the event can never
@@ -97,6 +102,13 @@ async def broadcast_delivery_update(attempt: DeliveryAttempt) -> None:
     Call this *after* the change is committed. An event that beat its own commit
     would leave a console showing a state that a reconnect (#11) then resyncs
     away.
+
+    ``fallback_triggered``/``fallback_channel`` annotate the attempt that
+    *failed*, not the one that replaces it — the contract's fallback event says
+    "this sms attempt failed and is being retried on voice", which is what lets
+    the console write "SMS failed → retrying via Voice" (#14) from one event.
+    The replacement attempt announces itself separately, as any new attempt
+    does.
     """
     event = DeliveryUpdateEvent(
         alert_id=attempt.alert_id,
@@ -104,6 +116,8 @@ async def broadcast_delivery_update(attempt: DeliveryAttempt) -> None:
         channel=Channel(attempt.channel),
         status=DeliveryStatus(attempt.status),
         attempt_number=attempt.attempt_number,
+        fallback_triggered=fallback_triggered,
+        fallback_channel=fallback_channel,
     )
     await manager.broadcast(event)
     logger.info(
@@ -113,6 +127,8 @@ async def broadcast_delivery_update(attempt: DeliveryAttempt) -> None:
         channel=attempt.channel,
         attempt_number=attempt.attempt_number,
         status=attempt.status,
+        fallback_triggered=fallback_triggered,
+        fallback_channel=fallback_channel.value if fallback_channel else None,
         subscribers=manager.subscriber_count(attempt.alert_id),
     )
 
