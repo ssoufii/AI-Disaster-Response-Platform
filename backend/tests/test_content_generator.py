@@ -139,6 +139,19 @@ async def test_prompt_inputs_are_structured_not_concatenated_prose(
     }
 
 
+async def test_generation_can_be_asked_for_a_channel_the_household_does_not_prefer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fallback reroute generates for the channel it is rerouting *onto*; by
+    # then the household's preferred channel is the one that just failed.
+    create = _fake_client(VALID_RESPONSE, monkeypatch)
+
+    await content_generator.generate(_alert(), _household(), Channel.VOICE.value)
+
+    sent = json.loads(create.await_args.kwargs["messages"][0]["content"])
+    assert sent["channel"] == Channel.VOICE.value
+
+
 async def test_system_prompt_is_cached_and_identical_across_households(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -189,7 +202,7 @@ async def test_low_literacy_sms_over_160_characters_is_rejected(
     _fake_client({**VALID_RESPONSE, "sms_text": "Evacuate now. " * 20}, monkeypatch)
 
     with pytest.raises(ContentGenerationError):
-        await content_generator._generate_once(_alert(), _household())
+        await content_generator._generate_once(_alert(), _household(), Channel.SMS.value)
 
 
 @pytest.mark.parametrize(
@@ -207,7 +220,7 @@ async def test_unvalidatable_response_fails_loudly(
     _fake_client(payload, monkeypatch)
 
     with pytest.raises(ContentGenerationError):
-        await content_generator._generate_once(_alert(), _household())
+        await content_generator._generate_once(_alert(), _household(), Channel.SMS.value)
 
 
 async def test_response_without_a_text_block_fails_loudly(
@@ -222,7 +235,7 @@ async def test_response_without_a_text_block_fails_loudly(
     )
 
     with pytest.raises(ContentGenerationError):
-        await content_generator._generate_once(_alert(), _household())
+        await content_generator._generate_once(_alert(), _household(), Channel.SMS.value)
 
 
 # --- Retry and template fallback (issue #5) ---------------------------------

@@ -12,6 +12,7 @@ the webhook refuses anything unsigned.
 """
 
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -99,7 +100,7 @@ def twilio(monkeypatch: pytest.MonkeyPatch) -> FakeTwilio:
 
 
 @pytest.fixture
-async def session() -> AsyncGenerator[AsyncSession, None]:
+async def session(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[AsyncSession, None]:
     engine = create_async_engine(
         "sqlite+aiosqlite://",
         connect_args={"check_same_thread": False},
@@ -110,6 +111,16 @@ async def session() -> AsyncGenerator[AsyncSession, None]:
 
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with factory() as session:
+        # Background work — the reroute the status webhook schedules — opens its
+        # own session, because in production the request that scheduled it has
+        # already closed hers. Here it is handed this test's session instead, so
+        # the task reads the in-memory database the test wrote rather than
+        # reaching for DATABASE_URL and a PostgreSQL instance no test has.
+        @asynccontextmanager
+        async def test_session_scope() -> AsyncGenerator[AsyncSession, None]:
+            yield session
+
+        monkeypatch.setattr(delivery_service, "session_scope", test_session_scope)
         yield session
 
     await engine.dispose()

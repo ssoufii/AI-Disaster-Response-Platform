@@ -6,8 +6,8 @@ twice.
 
 Twilio retries a callback it does not get a timely 200 for — that is documented
 behavior, not a fault. Without a record of what has already been applied, a
-routine retry would write the same status a second time, and (once rerouting
-lands with #12) fire the fallback for the same failure twice, leaving two
+routine retry would write the same status a second time, and fire the fallback
+for the same failure twice, leaving two
 ``DeliveryAttempt`` rows for one reroute. Domain Rule 2 exists to make the audit
 trail trustworthy; a duplicated chain of attempts is exactly the corruption it
 guards against.

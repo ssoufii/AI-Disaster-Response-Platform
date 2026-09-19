@@ -1,26 +1,31 @@
-"""SMS dispatch, the Twilio status webhook, and the status snapshot.
+"""SMS dispatch, the Twilio status webhook, fallback rerouting, and the snapshot.
 
-The first end-to-end slice: dispatch → Twilio → status callback → DB → snapshot.
-Twilio is replaced by the autouse ``twilio`` fixture in ``conftest``, so nothing
-here sends a message (CLAUDE.md, Testing).
+The end-to-end slice: dispatch → Twilio → status callback → DB → reroute onto
+the next channel → snapshot. Twilio is replaced by the autouse ``twilio``
+fixture in ``conftest`` and Anthropic by ``claude_calls`` below, so nothing here
+reaches a live API (CLAUDE.md, Testing).
 """
 
 import json
+import pathlib
 import uuid
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import BackgroundTasks
 from httpx import AsyncClient
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.config import settings
+from app.models.alert_content import AlertContent
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.delivery_status_callback import DeliveryStatusCallback
-from app.services import content_generator
+from app.services import content_generator, delivery_service
 from app.webhooks import twilio_status
+from scripts.seed import TWILIO_UNDELIVERABLE_SMS_NUMBER, seed_demo_data
 from tests.conftest import (
     PUBLIC_BASE_URL,
     TWILIO_AUTH_TOKEN,
@@ -33,10 +38,17 @@ SMS_TEXT = "Evacuate now. Go to Lincoln High School, 400 Oak St."
 
 
 @pytest.fixture(autouse=True)
-def fake_claude(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every dispatch here generates content; none of it reaches Anthropic."""
+def claude_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Every dispatch here generates content; none of it reaches Anthropic.
 
-    async def create(**_kwargs: Any) -> SimpleNamespace:
+    Returns the calls as they are made, so a test can check *what* was asked
+    for — a reroute generates for the channel it is rerouting onto, not for the
+    one that just failed.
+    """
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> SimpleNamespace:
+        calls.append(kwargs)
         payload = json.dumps(
             {
                 "sms_text": SMS_TEXT,
@@ -52,6 +64,12 @@ def fake_claude(monkeypatch: pytest.MonkeyPatch) -> None:
         "get_client",
         lambda: SimpleNamespace(messages=SimpleNamespace(create=create)),
     )
+    return calls
+
+
+def _requested_channels(calls: list[dict[str, Any]]) -> list[str]:
+    """The channel each generation was asked for, in order."""
+    return [json.loads(call["messages"][0]["content"])["channel"] for call in calls]
 
 
 async def _zone(client: AsyncClient, name: str = "Riverside District") -> str:
@@ -407,7 +425,7 @@ async def test_a_retried_callback_creates_no_second_row_anywhere(
 ) -> None:
     # The duplicate returns before any side effect, which is what keeps a retried
     # failure from producing a second WebSocket event (#10) or a second fallback
-    # attempt (#12) once those hang off this handler.
+    # attempt, both of which hang off this handler.
     alert_id, _ = await _dispatch_one_sms_household(client)
     sid = twilio.messages.sent[0].sid
 
@@ -416,7 +434,9 @@ async def test_a_retried_callback_creates_no_second_row_anywhere(
             client, MessageSid=sid, MessageStatus="failed", ErrorCode="30006", ErrorMessage="Dead"
         )
 
-    assert len(await _attempts(session, alert_id)) == 1
+    # Three callbacks, one failure: the original attempt and the single fallback
+    # the first of them triggered.
+    assert len(await _attempts(session, alert_id)) == 2
     assert len(await _callbacks(session, sid)) == 1
 
 
@@ -664,6 +684,317 @@ async def test_a_refused_callback_is_logged_without_the_auth_token(
         ("warning", "twilio_status.invalid_signature")
     ]
     assert TWILIO_AUTH_TOKEN not in json.dumps(recorder.calls[0][2])
+
+
+# --- Fallback rerouting ------------------------------------------------------
+#
+# The feature the project is named for: a terminal failure starts a *new*
+# attempt on the household's next channel, from the webhook, without a human
+# and without a poll.
+
+
+async def _contents(session: AsyncSession, alert_id: str) -> list[AlertContent]:
+    return list(
+        (
+            await session.exec(
+                select(AlertContent).where(AlertContent.alert_id == uuid.UUID(alert_id))
+            )
+        ).all()
+    )
+
+
+async def _fail_first_attempt(client: AsyncClient, twilio: FakeTwilio, **params: str) -> Any:
+    """Report the first SMS as undelivered, the way Twilio does."""
+    return await _post_status(
+        client,
+        MessageSid=twilio.messages.sent[0].sid,
+        MessageStatus="undelivered",
+        ErrorCode="30006",
+        ErrorMessage="Landline or unreachable carrier",
+        **params,
+    )
+
+
+async def test_a_failed_attempt_starts_a_new_one_on_the_next_channel(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, household_id = await _dispatch_one_sms_household(client)
+
+    await _fail_first_attempt(client, twilio)
+
+    attempts = await _attempts(session, alert_id)
+    assert [(a.channel, a.attempt_number, a.status) for a in attempts] == [
+        ("sms", 1, "failed"),
+        # The household's fallback_channel_order is ["voice"], so attempt 1's
+        # successor is its first entry.
+        ("voice", 2, "queued"),
+    ]
+    assert all(a.household_id == uuid.UUID(household_id) for a in attempts)
+
+
+async def test_the_failed_attempt_is_left_exactly_as_it_was(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 2: a fallback is a new row, never a retry written over the old
+    # one. The failed row is the evidence that SMS was tried at all.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+
+    await _fail_first_attempt(client, twilio)
+
+    failed = (await _attempts(session, alert_id))[0]
+    await session.refresh(failed)
+    assert failed.status == "failed"
+    assert failed.channel == "sms"
+    assert failed.attempt_number == 1
+    assert failed.twilio_sid == sid
+    assert failed.error_reason == "30006: Landline or unreachable carrier"
+    assert failed.completed_at is not None
+
+
+async def test_an_in_flight_status_never_reroutes(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # queued/sending are the delivery still happening. A fallback fired on one
+    # of these would race the message it is giving up on.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+
+    await _post_status(client, MessageSid=sid, MessageStatus="queued")
+    await _post_status(client, MessageSid=sid, MessageStatus="sending")
+
+    assert len(await _attempts(session, alert_id)) == 1
+
+
+async def test_a_delivered_status_never_reroutes(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_sms_household(client)
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="delivered")
+
+    assert len(await _attempts(session, alert_id)) == 1
+
+
+async def test_a_retried_failure_callback_reroutes_only_once(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Twilio retries, and it has two names for one failure. Either would be a
+    # second reroute — and two fallback rows for one failure — without the
+    # idempotency guard the reroute hangs off.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+    sid = twilio.messages.sent[0].sid
+
+    await _fail_first_attempt(client, twilio)
+    await _fail_first_attempt(client, twilio)
+    await _post_status(client, MessageSid=sid, MessageStatus="failed")
+
+    attempts = await _attempts(session, alert_id)
+    assert [(a.channel, a.attempt_number) for a in attempts] == [("sms", 1), ("voice", 2)]
+
+
+async def test_the_fallback_channel_gets_content_generated_for_it(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio, claude_calls: list[Any]
+) -> None:
+    alert_id, household_id = await _dispatch_one_sms_household(client)
+
+    await _fail_first_attempt(client, twilio)
+
+    # Generated for the channel being rerouted *onto*: what reads well as an SMS
+    # is not what a voice call should say.
+    assert _requested_channels(claude_calls) == ["sms", "voice"]
+    contents = await _contents(session, alert_id)
+    assert sorted(c.channel for c in contents) == ["sms", "voice"]
+    assert all(c.household_id == uuid.UUID(household_id) for c in contents)
+
+
+async def test_content_already_written_for_the_fallback_channel_is_reused(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio, claude_calls: list[Any]
+) -> None:
+    alert_id, household_id = await _dispatch_one_sms_household(client)
+    session.add(
+        AlertContent(
+            alert_id=uuid.UUID(alert_id),
+            household_id=uuid.UUID(household_id),
+            channel="voice",
+            generated_text=SMS_TEXT,
+            generated_script="Already written for voice.",
+            video_caption_text=SMS_TEXT,
+            language="en",
+        )
+    )
+    await session.commit()
+
+    await _fail_first_attempt(client, twilio)
+
+    # Only the dispatch's own generation ran: a reroute does not pay for content
+    # this alert already has for that channel.
+    assert _requested_channels(claude_calls) == ["sms"]
+    assert len(await _contents(session, alert_id)) == 2
+
+
+async def test_a_fallback_onto_sms_is_dispatched_immediately(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Voice (#16) and ASL/video (#19) cannot be sent on yet, so a second SMS is
+    # the one fallback this build can carry all the way to Twilio.
+    alert_id, _ = await _dispatch_one_sms_household(client, fallback_channel_order=["sms"])
+
+    await _fail_first_attempt(client, twilio)
+
+    assert len(twilio.messages.sent) == 2
+    fallback = (await _attempts(session, alert_id))[1]
+    assert fallback.channel == "sms"
+    assert fallback.attempt_number == 2
+    assert fallback.twilio_sid == twilio.messages.sent[1].sid
+
+
+async def test_a_fallback_onto_a_channel_this_build_cannot_send_stays_queued(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The row is created because the chain really did move onto voice; nothing
+    # is sent, because voice is #16. Marking it failed instead would walk the
+    # household down its chain for a channel that was never tried.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+
+    await _fail_first_attempt(client, twilio)
+
+    assert len(twilio.messages.sent) == 1
+    fallback = (await _attempts(session, alert_id))[1]
+    assert fallback.status == "queued"
+    assert fallback.twilio_sid is None
+
+
+async def test_each_failure_walks_one_step_further_down_the_chain(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Two SMS fallbacks deep, so every step can actually be sent and failed.
+    alert_id, _ = await _dispatch_one_sms_household(client, fallback_channel_order=["sms", "sms"])
+
+    for index in range(3):
+        await _post_status(
+            client, MessageSid=twilio.messages.sent[index].sid, MessageStatus="failed"
+        )
+
+    attempts = await _attempts(session, alert_id)
+    assert [(a.channel, a.attempt_number) for a in attempts] == [
+        ("sms", 1),
+        ("sms", 2),
+        ("sms", 3),
+    ]
+    # The chain is three long and stops there: the fourth failure has nowhere to
+    # go. Marking the household `unreached` at that point is #13's.
+    assert [a.status for a in attempts] == ["failed", "failed", "failed"]
+
+
+async def test_a_household_with_no_fallback_channels_gets_no_second_attempt(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_sms_household(client, fallback_channel_order=[])
+
+    await _fail_first_attempt(client, twilio)
+
+    assert len(await _attempts(session, alert_id)) == 1
+
+
+async def test_rerouting_is_scheduled_as_a_task_rather_than_done_inline(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 3, and the reason Twilio gets its 200 fast: the handler
+    # schedules the reroute and returns. Calling the handler directly is the
+    # only way to see the task it hands back.
+    await _dispatch_one_sms_household(client)
+    background = BackgroundTasks()
+
+    ack = await twilio_status.twilio_status(
+        background=background,
+        params={"MessageSid": twilio.messages.sent[0].sid, "MessageStatus": "failed"},
+        session=session,
+    )
+
+    assert ack.result == "applied"
+    assert [task.func for task in background.tasks] == [delivery_service.reroute_failed_attempt]
+
+
+async def test_an_in_flight_status_schedules_no_task_at_all(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    await _dispatch_one_sms_household(client)
+    background = BackgroundTasks()
+
+    await twilio_status.twilio_status(
+        background=background,
+        params={"MessageSid": twilio.messages.sent[0].sid, "MessageStatus": "sending"},
+        session=session,
+    )
+
+    assert background.tasks == []
+
+
+async def test_rerouting_has_exactly_one_trigger_in_the_whole_codebase() -> None:
+    # Domain Rule 3 is a statement about the codebase, not just this module: no
+    # cron, no scheduler, no sweep of failed attempts — one webhook-driven task.
+    backend = pathlib.Path(__file__).resolve().parent.parent
+    sources = {
+        path: path.read_text()
+        for path in (backend / "app").rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
+
+    callers = sorted(
+        path.name for path, source in sources.items() if "reroute_failed_attempt" in source
+    )
+    assert callers == ["delivery_service.py", "twilio_status.py"]
+    assert "schedule" not in (backend / "pyproject.toml").read_text().lower()
+
+
+async def test_the_guaranteed_fail_seed_household_is_rerouted_onto_voice(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The fixture from #3 that exists to make this path provable: Twilio's
+    # undeliverable-SMS number, with a two-deep fallback order.
+    zone, households = await seed_demo_data(session)
+    okonkwo = next(h for h in households if h.phone_number == TWILIO_UNDELIVERABLE_SMS_NUMBER)
+    alert_id = await _alert(client, str(zone.id))
+    await client.post(f"/alerts/{alert_id}/dispatch")
+    sid = next(
+        message.sid
+        for message in twilio.messages.sent
+        if message.params["to"] == TWILIO_UNDELIVERABLE_SMS_NUMBER
+    )
+
+    await _post_status(
+        client,
+        MessageSid=sid,
+        MessageStatus="undelivered",
+        ErrorCode="21614",
+        ErrorMessage="To number is not a valid mobile number",
+    )
+
+    attempts = [
+        attempt
+        for attempt in await _attempts(session, alert_id)
+        if attempt.household_id == okonkwo.id
+    ]
+    assert [(a.channel, a.attempt_number, a.status) for a in attempts] == [
+        ("sms", 1, "failed"),
+        ("voice", 2, "queued"),
+    ]
+
+
+async def test_a_reroute_for_an_attempt_that_vanished_is_logged_not_raised(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing awaits the task, so an exception in it would be swallowed by the
+    # event loop. It has to report its own failures.
+    recorder = RecordingLogger()
+    monkeypatch.setattr(delivery_service, "logger", recorder)
+
+    await delivery_service.reroute_failed_attempt(uuid.uuid4())
+
+    assert [(level, event) for level, event, _ in recorder.calls] == [
+        ("error", "delivery.reroute_attempt_missing")
+    ]
 
 
 # --- The status snapshot -----------------------------------------------------

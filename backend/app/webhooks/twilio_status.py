@@ -9,27 +9,32 @@ Twilio quotes, apply the status, return 200. Nothing slow belongs here — no
 Claude generation, no outbound send — because Twilio times the callback out and
 retries, and a slow handler turns one delivery into a pile of duplicates.
 
+A terminal failure is the one thing that does start further work, and it starts
+it *after* the 200: the reroute onto the household's next channel is scheduled
+as a background task and generates and sends on its own time. That task is the
+only trigger rerouting has — nothing polls Twilio or sweeps the table for failed
+attempts (CLAUDE.md, Domain Rule 3).
+
 Twilio reaches this endpoint from the public internet, so it cannot be
 authenticated the way the rest of the API is. What stands in its place is the
 signature check below: every callback must carry an ``X-Twilio-Signature`` that
 only the account's auth token can produce, or it is refused with a 403 before a
 single row is read. Without it, anyone who found the URL could post forged
-delivery state into the audit trail — or, once #12 lands, trigger rerouting
-against real households.
+delivery state into the audit trail — or trigger rerouting against real
+households.
 
 The handler is also idempotent, because Twilio retries any callback it does not
 get a timely 200 for. Each state Twilio reports is recorded as a
 ``DeliveryStatusCallback`` keyed on ``(twilio_sid, status)``; a callback whose
 state is already on record is a no-op that still answers 200, so a retry cannot
-write the same status twice or — once #12 lands — reroute the same failure
-twice.
+write the same status twice or reroute the same failure twice.
 """
 
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -41,8 +46,8 @@ from app.models.delivery_attempt import DeliveryAttempt
 from app.models.delivery_status_callback import DeliveryStatusCallback
 from app.models.enums import DeliveryStatus
 from app.schemas.delivery_attempt import TwilioStatusAck
-from app.services import dispatcher_ws
-from app.services.delivery_service import status_callback_url
+from app.services import delivery_service, dispatcher_ws
+from app.services.delivery_service import FALLBACK_TRIGGER_STATUSES, status_callback_url
 
 router = APIRouter(prefix="/webhooks/twilio", tags=["webhooks"])
 
@@ -133,6 +138,7 @@ async def verified_twilio_params(request: Request) -> dict[str, str]:
 
 @router.post("/status", response_model=TwilioStatusAck)
 async def twilio_status(
+    background: BackgroundTasks,
     params: dict[str, str] = Depends(verified_twilio_params),
     session: AsyncSession = Depends(get_session),
 ) -> TwilioStatusAck:
@@ -170,7 +176,7 @@ async def twilio_status(
     if not await _record_callback(session, attempt, twilio_sid, status, raw_status):
         # Already applied. Returning before anything is written is what makes
         # the retry harmless: no second status write, no second WebSocket event,
-        # and no second fallback attempt row (#12), because none of that is
+        # and no second fallback attempt row, because none of that is
         # downstream of this line.
         log.info(
             "twilio_status.duplicate_callback",
@@ -201,6 +207,23 @@ async def twilio_status(
     # not accepted. In-process and non-blocking, so it does not slow the 200
     # down — nothing here waits on Twilio, Claude or the network.
     await dispatcher_ws.broadcast_delivery_update(attempt)
+
+    if status in FALLBACK_TRIGGER_STATUSES:
+        # Scheduled, not awaited: the reroute generates content and sends, and
+        # Twilio times this callback out and retries if it is made to wait for
+        # either. The task runs the moment the 200 is on the wire — this is the
+        # whole of Domain Rule 3's "webhook-driven, not polled", and it is
+        # downstream of the duplicate guard above, so a retried callback cannot
+        # schedule a second reroute for the same failure.
+        background.add_task(delivery_service.reroute_failed_attempt, attempt.id)
+        log.info(
+            "twilio_status.fallback_scheduled",
+            twilio_sid=twilio_sid,
+            channel=attempt.channel,
+            attempt_number=attempt.attempt_number,
+            status=attempt.status,
+        )
+
     return TwilioStatusAck(result="applied", status=status)
 
 

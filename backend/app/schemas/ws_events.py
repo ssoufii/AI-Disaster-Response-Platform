@@ -10,9 +10,10 @@ client that never saw attempt 1. That is why each event repeats the household,
 channel, attempt number and status in full rather than referring to an attempt
 id the client would have to resolve.
 
-``fallback_triggered`` and ``fallback_channel`` are part of the contract from
-the start, and are false/null until rerouting lands (#12) — the console reads
-them on every event and must not have to handle their sudden appearance.
+``fallback_triggered`` and ``fallback_channel`` annotate the attempt that
+*failed*, naming the channel its household is being retried on; every other
+event carries them as false/null. The console reads them on every event rather
+than having to handle their sudden appearance.
 
 This schema is one of three that have to move together: the TypeScript types in
 ``frontend/lib/types.ts`` and the contract in ``docs/architecture.md`` are the
