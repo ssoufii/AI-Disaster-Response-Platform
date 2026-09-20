@@ -174,8 +174,17 @@ This loop is what the resume line "re-routing failed deliveries to a fallback ch
 - `fallback_channel_order` holds *only* the fallbacks — the preferred channel is attempt 1 and is not in the list — so attempt *n*'s successor is the list's *n*-th entry counting from one (`fallback_channel_order[attempt_number - 1]`). Attempt 1 on `sms` falls back to `fallback_channel_order[0]`, whose failure as attempt 2 falls back to `fallback_channel_order[1]`.
 - The fallback channel gets **its own `AlertContent`**, generated before the send if this alert has none for that channel yet: an SMS read aloud down a phone line is not what the voice channel should say. `content_generator.generate` takes the channel to generate *for*, since the household's preference is by then the channel that failed, and it never raises — a Claude failure returns the template, so it can never be the reason a reroute stops.
 - Only SMS can actually be sent, so a fallback onto voice (#16) or video/WhatsApp (#19) creates its row and leaves it `queued`, logged as `delivery.channel_not_implemented`. It is deliberately **not** marked failed: nothing was tried, and calling it a failure would walk the household further down its chain for a channel this build has not built.
-- When the chain runs out, the reroute logs `delivery.fallback_exhausted` and returns without a new attempt. Marking the household `unreached` and emitting the event that flags it for a human is #13's.
-- A send Twilio refuses outright (an invalid number, an auth error) never gets a status callback, so it is recorded as a failed attempt and pushed to the console, but it is **not** rerouted — the trigger is the callback. Twilio's undeliverable-SMS test number (`+15005550009`, the guaranteed-fail seed household) fails that way against a live test account, so exercising that household's chain end-to-end needs a number that fails *after* Twilio accepts the message. Worth revisiting with #13, where a household that runs out of channels has to be marked `unreached` however its last attempt died.
+- When the chain runs out, the reroute returns without a new attempt and the household is marked **`unreached`** (see the exhaustion notes below).
+- A send Twilio refuses outright (an invalid number, an auth error) never gets a status callback, so it is recorded as a failed attempt and pushed to the console, but it is **not** rerouted — the trigger is the callback. Twilio's undeliverable-SMS test number (`+15005550009`, the guaranteed-fail seed household) fails that way against a live test account, so exercising that household's chain end-to-end needs a number that fails *after* Twilio accepts the message. This is still a gap: such a household never enters the reroute path, so it is never marked `unreached` either, and the only evidence is its failed row on the console. Closing it means giving the refused-send path its own reroute trigger, which is a change to #12's "the trigger is the callback and nothing else" and belongs to a story of its own.
+
+**Fallback exhaustion** (`delivery_service._mark_unreached`, `dispatcher_ws.broadcast_household_unreached`):
+- Domain Rule 4 — "a household is never silently dropped... failing silently is the worst possible outcome here" — is enforced in exactly one place: the branch of `reroute` where `next_fallback_channel` returns `None`. There is no other path that decides a household is unreachable.
+- It sets `household.last_known_status = "unreached"`, commits, logs `delivery.fallback_exhausted` at **warning** with the alert, household, last channel and attempt count, and then emits a `household_unreached` event. All three are deliberate: the log for an operator tailing an incident, the status for a dispatcher who reloads the page, the event for one already watching it. Any one of them alone leaves a way for the household to disappear.
+- The status is committed **before** the broadcast, so no console is shown a household the database has not accepted as unreached.
+- **The attempt rows are not touched.** Exhaustion is a verdict about the household written *beside* the chain, never over it (Domain Rule 2) — every attempt keeps its own status, `error_reason` and timestamps, and no new attempt is created.
+- A household with channels still left in `fallback_channel_order` is never marked: the chain simply continues. A household whose `fallback_channel_order` is empty *is* marked on its first failure — the preferred channel was its whole chain.
+- `last_known_status` lives on the household, not on the attempt, which is what the console colours red (#14) and what `GET /alerts/{id}/status` reports on a reload. It is a household-level column, so it is not scoped to one alert: a household marked `unreached` stays so until something sets it otherwise, and nothing does yet. Clearing it (on a later `delivered`, or per-alert) is not in #13's scope.
+- The webhook's idempotency guard sits upstream of the reroute, so a retried failure callback cannot re-mark or re-announce a household that is already unreached.
 
 **Implementation notes** (`backend/app/services/delivery_service.py`):
 - The Twilio SDK is instantiated here and nowhere else, behind a lazily-built `get_client()` so importing the module (in tests, in Alembic) never needs credentials. The client is backed by `AsyncTwilioHttpClient` and sends via `messages.create_async`, because a zone dispatch sends from inside the request path and no blocking I/O is allowed there.
@@ -183,7 +192,7 @@ This loop is what the resume line "re-routing failed deliveries to a fallback ch
 - Every send sets `status_callback` to `{PUBLIC_BASE_URL}/webhooks/twilio/status`. A send without it is a send whose outcome is unknowable, since nothing polls Twilio for status.
 - A Twilio error is caught, recorded on that household's attempt as `failed` with `error_reason`, and logged; it never propagates into the dispatch loop and strands the households behind it. Rerouting a *callback-reported* failure onto the next channel is webhook-triggered (see the fallback notes above); a send Twilio refused outright stops at its failed row, because no callback is ever coming for it.
 - `deliver_alert` skips households that already have an attempt for this alert, so re-dispatching never sends the same warning twice — the same promise content generation makes about its rows.
-- Only the SMS channel is wired up so far. A household whose `preferred_channel` is voice (#16) or video/WhatsApp (#19) is logged and left without an attempt rather than sent something it cannot receive. That is a build-order gap, **not** Domain Rule 4's `unreached`, which means an exhausted fallback chain and is issue #13's to set.
+- Only the SMS channel is wired up so far. A household whose `preferred_channel` is voice (#16) or video/WhatsApp (#19) is logged and left without an attempt rather than sent something it cannot receive. That is a build-order gap, **not** Domain Rule 4's `unreached`, which means a fallback chain that was tried and ran out.
 - Delivery-path log lines carry `alert_id` and `household_id`, and phone numbers only ever appear through `redact_phone` (last 4 digits) from `app/logging_config.py`.
 
 **Status webhook** (`backend/app/webhooks/twilio_status.py`, `POST /webhooks/twilio/status`):
@@ -259,6 +268,17 @@ Key endpoints:
   "timestamp": "..."
 }
 ```
+```json
+{
+  "type": "household_unreached",
+  "alert_id": "...",
+  "household_id": "...",
+  "last_channel": "voice",
+  "attempts_made": 2,
+  "last_known_status": "unreached",
+  "timestamp": "..."
+}
+```
 
 **Implementation notes** (`backend/app/services/dispatcher_ws.py`, `backend/app/schemas/ws_events.py`):
 - The schema lives in `app/schemas/ws_events.py`, and is one of three things that move together: `frontend/lib/types.ts` and this document are the other two.
@@ -269,7 +289,9 @@ Key endpoints:
 - A send to a dead socket drops that subscriber and never raises. Broadcasting happens on the webhook's path, and a browser tab that closed mid-dispatch must not turn into a 500 on a Twilio callback.
 - Events are emitted from two places, both after their commit: the status webhook when a callback is applied, and `delivery_service` when an attempt is first committed as `queued`, when a reroute annotates the attempt it is replacing, and if the send is refused outright. The second matters because a send Twilio never accepted gets no callback, so without it that failure would never reach the console at all.
 - A single instance is assumed. A second uvicorn worker would keep its own registry and its consoles would not see these events; scaling the socket layer out is out of scope.
-- `household_unreached` (#13), `dispatch_started` and `dispatch_complete` are part of the contract but are not emitted yet. The console ignores event types it does not recognise, so they can land without breaking a console that predates them.
+- `household_unreached` is the second event on this socket and the only one about a *household* rather than an attempt: its whole fallback chain has been tried and nothing landed, so the next move belongs to a person (Domain Rule 4). It carries `last_known_status: "unreached"` rather than a delivery status — the grid colours a row red on what the household *is*, which is also what the snapshot reports for it on a reload — plus `last_channel` and `attempts_made`, so a console that connected after the fact can still say what was tried.
+- It is emitted **alongside** the failed attempt's own `delivery_update`, not instead of it: "this channel did not land" and "there is no next channel" are two facts, and the console needs both.
+- Its type is declared in `frontend/lib/types.ts` but the socket does not forward it to the reducer yet — rendering the red "needs a human" row is #14's. `dispatch_started` and `dispatch_complete` are part of the contract and not emitted at all yet. The console ignores event types it does not recognise, so all three can land without breaking a console that predates them.
 
 ---
 

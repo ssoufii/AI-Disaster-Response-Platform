@@ -30,7 +30,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import Channel, DeliveryStatus
-from app.schemas.ws_events import DeliveryUpdateEvent
+from app.models.household import Household
+from app.schemas.ws_events import AlertEvent, DeliveryUpdateEvent, HouseholdUnreachedEvent
 
 logger = structlog.get_logger(__name__)
 
@@ -59,7 +60,7 @@ class ConnectionManager:
     def subscriber_count(self, alert_id: uuid.UUID) -> int:
         return len(self._connections.get(alert_id, ()))
 
-    async def broadcast(self, event: DeliveryUpdateEvent) -> None:
+    async def broadcast(self, event: AlertEvent) -> None:
         """Send one event to every console watching its alert.
 
         Iterates a copy of the subscriber set, because a send that fails removes
@@ -130,6 +131,40 @@ async def broadcast_delivery_update(
         fallback_triggered=fallback_triggered,
         fallback_channel=fallback_channel.value if fallback_channel else None,
         subscribers=manager.subscriber_count(attempt.alert_id),
+    )
+
+
+async def broadcast_household_unreached(
+    household: Household, last_attempt: DeliveryAttempt
+) -> None:
+    """Flag a household whose every channel has failed, for a human to pick up.
+
+    The one event on this socket that is about a household rather than an
+    attempt: its fallback chain is spent, nothing further will be tried, and the
+    only thing left that can reach it is a person (CLAUDE.md, Domain Rule 4).
+
+    Emitted alongside — not instead of — the failed attempt's own
+    ``delivery_update``. The attempt's event says that channel did not land;
+    this one says there is no next channel, which is a different fact and the
+    one that needs a dispatcher.
+
+    Logged at warning, because an ``info`` line is not what "nobody warned this
+    household" deserves in a log being read during an incident.
+    """
+    event = HouseholdUnreachedEvent(
+        alert_id=last_attempt.alert_id,
+        household_id=household.id,
+        last_channel=Channel(last_attempt.channel),
+        attempts_made=last_attempt.attempt_number,
+    )
+    await manager.broadcast(event)
+    logger.warning(
+        "dispatcher_ws.household_unreached",
+        alert_id=str(last_attempt.alert_id),
+        household_id=str(household.id),
+        last_channel=last_attempt.channel,
+        attempts_made=last_attempt.attempt_number,
+        subscribers=manager.subscriber_count(last_attempt.alert_id),
     )
 
 
