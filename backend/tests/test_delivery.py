@@ -23,6 +23,7 @@ from app.config import settings
 from app.models.alert_content import AlertContent
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.delivery_status_callback import DeliveryStatusCallback
+from app.models.household import Household
 from app.services import content_generator, delivery_service
 from app.webhooks import twilio_status
 from scripts.seed import TWILIO_UNDELIVERABLE_SMS_NUMBER, seed_demo_data
@@ -882,8 +883,8 @@ async def test_each_failure_walks_one_step_further_down_the_chain(
         ("sms", 2),
         ("sms", 3),
     ]
-    # The chain is three long and stops there: the fourth failure has nowhere to
-    # go. Marking the household `unreached` at that point is #13's.
+    # The chain is three long and stops there: the third failure has nowhere
+    # left to go, which is what marks the household unreached below.
     assert [a.status for a in attempts] == ["failed", "failed", "failed"]
 
 
@@ -995,6 +996,134 @@ async def test_a_reroute_for_an_attempt_that_vanished_is_logged_not_raised(
     assert [(level, event) for level, event, _ in recorder.calls] == [
         ("error", "delivery.reroute_attempt_missing")
     ]
+
+
+# --- Fallback exhaustion -----------------------------------------------------
+#
+# The end of the chain. Domain Rule 4: a household whose every channel has
+# failed is flagged for a person, never dropped quietly — "failing silently is
+# the worst possible outcome here."
+
+
+async def _household_row(session: AsyncSession, household_id: str) -> Household:
+    household = await session.get(Household, uuid.UUID(household_id))
+    assert household is not None
+    await session.refresh(household)
+    return household
+
+
+async def test_a_household_whose_last_channel_fails_is_marked_unreached(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # No fallbacks at all, so the preferred channel's failure is already the end
+    # of this household's chain.
+    _, household_id = await _dispatch_one_sms_household(client, fallback_channel_order=[])
+
+    await _fail_first_attempt(client, twilio)
+
+    assert (await _household_row(session, household_id)).last_known_status == "unreached"
+
+
+async def test_a_household_with_a_channel_left_is_not_marked_unreached(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The chain continues onto voice, so nothing about this household needs a
+    # human yet — calling it unreached here would send a dispatcher to a door
+    # the system is still trying to reach by phone.
+    _, household_id = await _dispatch_one_sms_household(client)
+
+    await _fail_first_attempt(client, twilio)
+
+    assert (await _household_row(session, household_id)).last_known_status == "unknown"
+
+
+async def test_the_whole_chain_has_to_run_out_before_the_household_is_unreached(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Two SMS fallbacks deep, so every step can actually be sent and failed.
+    _, household_id = await _dispatch_one_sms_household(
+        client, fallback_channel_order=["sms", "sms"]
+    )
+
+    seen = []
+    for index in range(3):
+        await _post_status(
+            client, MessageSid=twilio.messages.sent[index].sid, MessageStatus="failed"
+        )
+        seen.append((await _household_row(session, household_id)).last_known_status)
+
+    # Only the failure with nothing after it flips the household.
+    assert seen == ["unknown", "unknown", "unreached"]
+
+
+async def test_marking_a_household_unreached_leaves_its_attempts_alone(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 2: the chain of rows is the audit trail of what was tried, and
+    # the household-level verdict is written beside it, never over it.
+    alert_id, _ = await _dispatch_one_sms_household(client, fallback_channel_order=["sms"])
+
+    for index in range(2):
+        await _post_status(
+            client, MessageSid=twilio.messages.sent[index].sid, MessageStatus="failed"
+        )
+
+    attempts = await _attempts(session, alert_id)
+    assert [(a.channel, a.attempt_number, a.status) for a in attempts] == [
+        ("sms", 1, "failed"),
+        ("sms", 2, "failed"),
+    ]
+    assert all(a.completed_at is not None for a in attempts)
+
+
+async def test_an_unreached_household_needs_no_further_attempt(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_sms_household(client, fallback_channel_order=[])
+
+    await _fail_first_attempt(client, twilio)
+
+    assert len(await _attempts(session, alert_id)) == 1
+    assert len(twilio.messages.sent) == 1
+
+
+async def test_a_snapshot_taken_afterwards_still_shows_who_needs_following_up(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    # A dispatcher who reloads mid-incident must still see the red rows: the
+    # WebSocket event is gone by then, and the snapshot is all the page has.
+    alert_id, household_id = await _dispatch_one_sms_household(client, fallback_channel_order=[])
+    await _fail_first_attempt(client, twilio)
+
+    body = (await client.get(f"/alerts/{alert_id}/status")).json()
+
+    row = next(row for row in body["households"] if row["household_id"] == household_id)
+    assert row["last_known_status"] == "unreached"
+    # The failed attempt is still what the row shows; "unreached" is the
+    # household's state, not the attempt's.
+    assert row["current_attempt"]["status"] == "failed"
+
+
+async def test_exhausting_a_chain_is_logged_as_a_warning_against_its_household(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, twilio: FakeTwilio
+) -> None:
+    # An operator reading the log during an incident needs this line to stand
+    # out and to name the household it is about.
+    recorder = RecordingLogger()
+    monkeypatch.setattr(delivery_service, "logger", recorder)
+    alert_id, household_id = await _dispatch_one_sms_household(client, fallback_channel_order=[])
+
+    await _fail_first_attempt(client, twilio)
+
+    level, _, context = next(
+        call for call in recorder.calls if call[1] == "delivery.fallback_exhausted"
+    )
+    assert level == "warning"
+    assert context["alert_id"] == alert_id
+    assert context["household_id"] == household_id
+    assert context["channel"] == "sms"
+    assert context["attempt_number"] == 1
+    assert context["last_known_status"] == "unreached"
 
 
 # --- The status snapshot -----------------------------------------------------

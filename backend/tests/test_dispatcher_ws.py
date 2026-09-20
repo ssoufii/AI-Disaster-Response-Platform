@@ -405,6 +405,108 @@ async def test_a_delivered_attempt_never_announces_a_fallback(
     assert [event["fallback_triggered"] for event in console.sent] == [False]
 
 
+# --- Broadcast from an exhausted fallback chain -------------------------------
+
+
+async def _dispatch_without_fallbacks(client: AsyncClient) -> tuple[str, str]:
+    """A household whose preferred channel is the whole of its chain."""
+    zone_id = await _zone(client)
+    alert_id = await _alert(client, zone_id)
+    household_id = (
+        await client.post(
+            "/households",
+            json={
+                "name": "Okonkwo household",
+                "phone_number": "+15550100002",
+                "language": "en",
+                "preferred_channel": "sms",
+                "fallback_channel_order": [],
+                "zone_id": zone_id,
+            },
+        )
+    ).json()["id"]
+    await client.post(f"/alerts/{alert_id}/dispatch")
+    return alert_id, household_id
+
+
+async def test_an_exhausted_chain_tells_the_console_a_household_needs_a_human(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 4: this event is the whole difference between a household
+    # flagged for someone to go and check on, and one that vanishes from view.
+    alert_id, household_id = await _dispatch_without_fallbacks(client)
+    console = await _watch(manager, alert_id)
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="failed")
+
+    unreached = next(event for event in console.sent if event["type"] == "household_unreached")
+    assert unreached["alert_id"] == alert_id
+    assert unreached["household_id"] == household_id
+
+
+async def test_the_unreached_event_carries_enough_state_to_be_applied_standalone(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_without_fallbacks(client)
+    console = await _watch(manager, alert_id)
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="failed")
+
+    event = next(event for event in console.sent if event["type"] == "household_unreached")
+    assert set(event) == {
+        "type",
+        "alert_id",
+        "household_id",
+        "last_channel",
+        "attempts_made",
+        "last_known_status",
+        "timestamp",
+    }
+    assert event["last_channel"] == Channel.SMS.value
+    assert event["attempts_made"] == 1
+    # The household's state, not the attempt's — it is what the console colours
+    # red, and what the snapshot reports for this household on a reload.
+    assert event["last_known_status"] == "unreached"
+    assert event["timestamp"].endswith("Z")
+
+
+async def test_the_failed_attempt_is_announced_as_well_as_the_household(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    # Two different facts: this channel did not land, and there is no next one.
+    alert_id, _ = await _dispatch_without_fallbacks(client)
+    console = await _watch(manager, alert_id)
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="failed")
+
+    assert [event["type"] for event in console.sent] == [
+        "delivery_update",
+        "household_unreached",
+    ]
+
+
+async def test_a_household_with_a_channel_left_is_not_announced_as_unreached(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch(client)
+    console = await _watch(manager, alert_id)
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="failed")
+
+    assert all(event["type"] == "delivery_update" for event in console.sent)
+
+
+async def test_an_unreached_event_does_not_leak_to_another_alerts_console(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_without_fallbacks(client)
+    bystander = await _watch(manager, str(uuid.uuid4()))
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="failed")
+
+    assert bystander.sent == []
+
+
 # --- Broadcast from the dispatch itself --------------------------------------
 
 

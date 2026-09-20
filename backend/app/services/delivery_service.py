@@ -27,6 +27,11 @@ Three things shape this module:
    mutating the failed one. It is called as a task from the status webhook the
    instant Twilio reports the failure — never from a polling loop (Domain
    Rule 3).
+6. **A household that runs out of channels is flagged, never dropped.** When
+   the chain has no next channel, the household is marked ``unreached`` and an
+   event is pushed asking for a human. Domain Rule 4 calls failing silently
+   here the worst possible outcome, and this is the only place that judgement
+   is made.
 """
 
 import uuid
@@ -46,7 +51,7 @@ from app.logging_config import redact_phone
 from app.models.alert import Alert
 from app.models.alert_content import AlertContent
 from app.models.delivery_attempt import DeliveryAttempt
-from app.models.enums import Channel, DeliveryStatus
+from app.models.enums import Channel, DeliveryStatus, HouseholdStatus
 from app.models.household import Household
 from app.services import content_generator, dispatcher_ws
 
@@ -317,8 +322,8 @@ async def reroute(session: AsyncSession, failed: DeliveryAttempt) -> DeliveryAtt
 
     Returns the new attempt, or ``None`` when the chain has no channel left —
     the point at which Domain Rule 4 says the household is ``unreached`` and
-    needs a human. Marking it so, and emitting the event that flags it, is
-    issue #13's; here the chain simply ends, loudly, in the log.
+    needs a human, which is what ``_mark_unreached`` below records and
+    announces.
 
     The failed attempt is never touched. Its status, its ``error_reason`` and
     its timestamps are the evidence that this channel was tried, and the audit
@@ -335,11 +340,7 @@ async def reroute(session: AsyncSession, failed: DeliveryAttempt) -> DeliveryAtt
 
     next_channel = next_fallback_channel(household, failed.attempt_number)
     if next_channel is None:
-        log.warning(
-            "delivery.fallback_exhausted",
-            channel=failed.channel,
-            attempt_number=failed.attempt_number,
-        )
+        await _mark_unreached(session, household, failed)
         return None
 
     content = await _content_for_channel(session, alert, household, next_channel)
@@ -355,6 +356,40 @@ async def reroute(session: AsyncSession, failed: DeliveryAttempt) -> DeliveryAtt
     )
     await _send(session, alert, household, attempt, content)
     return attempt
+
+
+async def _mark_unreached(
+    session: AsyncSession, household: Household, failed: DeliveryAttempt
+) -> None:
+    """Record that this household's every channel has been tried and failed.
+
+    The end of the chain, and the worst outcome this system has: no channel is
+    left to try, so the household stays unwarned unless a person goes to it.
+    Domain Rule 4 is explicit that this must never be the quiet path — the
+    status is written so a reload of ``GET /alerts/{id}/status`` still shows it,
+    the event is emitted so an open console goes red without one, and the log
+    line is a warning rather than an info.
+
+    ``last_known_status`` lives on the household, not on the attempt, because
+    "unreached" is a statement about the household after its whole chain ran
+    out — which is exactly what the console colours red (#14).
+
+    The write is committed before the broadcast, so no console is shown a
+    household the database has not accepted as unreached.
+    """
+    household.last_known_status = HouseholdStatus.UNREACHED.value
+    session.add(household)
+    await session.commit()
+
+    logger.warning(
+        "delivery.fallback_exhausted",
+        alert_id=str(failed.alert_id),
+        household_id=str(household.id),
+        channel=failed.channel,
+        attempt_number=failed.attempt_number,
+        last_known_status=household.last_known_status,
+    )
+    await dispatcher_ws.broadcast_household_unreached(household, failed)
 
 
 def next_fallback_channel(household: Household, failed_attempt_number: int) -> Channel | None:

@@ -71,12 +71,34 @@ export interface DeliveryUpdateEvent {
 }
 
 /**
+ * Every channel this household has was tried and none of them landed.
+ *
+ * About the household rather than an attempt, which is why it carries
+ * `last_known_status` instead of a delivery status: the grid colours a row red
+ * on what the household *is*, matching what `GET /alerts/{id}/status` reports
+ * for it on a reload. `last_channel` and `attempts_made` describe the chain
+ * that ran out, so a console that connected after the fact can still say what
+ * was tried.
+ */
+export interface HouseholdUnreachedEvent {
+  type: "household_unreached";
+  alert_id: string;
+  household_id: string;
+  last_channel: Channel;
+  attempts_made: number;
+  last_known_status: "unreached";
+  timestamp: string;
+}
+
+/**
  * What the console knows how to apply today.
  *
- * `household_unreached` (#13), `dispatch_started` and `dispatch_complete` are
- * part of the contract but are not emitted yet; the socket ignores any event
- * type it does not recognise, so they can land without breaking a console that
- * predates them.
+ * `household_unreached` is emitted by the backend (#13) and declared above so
+ * the three sides of the contract stay in step, but the socket does not forward
+ * it yet — rendering the red "needs a human" row is #14's. `dispatch_started`
+ * and `dispatch_complete` are part of the contract and not emitted at all yet.
+ * The socket ignores any event type it does not recognise, so all three can
+ * land without breaking a console that predates them.
  */
 export type AlertSocketEvent = DeliveryUpdateEvent;
 
