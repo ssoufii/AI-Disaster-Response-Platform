@@ -291,7 +291,7 @@ Key endpoints:
 - A single instance is assumed. A second uvicorn worker would keep its own registry and its consoles would not see these events; scaling the socket layer out is out of scope.
 - `household_unreached` is the second event on this socket and the only one about a *household* rather than an attempt: its whole fallback chain has been tried and nothing landed, so the next move belongs to a person (Domain Rule 4). It carries `last_known_status: "unreached"` rather than a delivery status — the grid colours a row red on what the household *is*, which is also what the snapshot reports for it on a reload — plus `last_channel` and `attempts_made`, so a console that connected after the fact can still say what was tried.
 - It is emitted **alongside** the failed attempt's own `delivery_update`, not instead of it: "this channel did not land" and "there is no next channel" are two facts, and the console needs both.
-- Its type is declared in `frontend/lib/types.ts` but the socket does not forward it to the reducer yet — rendering the red "needs a human" row is #14's. `dispatch_started` and `dispatch_complete` are part of the contract and not emitted at all yet. The console ignores event types it does not recognise, so all three can land without breaking a console that predates them.
+- The console forwards it to its reducer and renders the red "needs a human" row from it (#14). `dispatch_started` and `dispatch_complete` are part of the contract and not emitted at all yet; the console ignores event types it does not recognise, so both can land without breaking a console that predates them.
 
 ---
 
@@ -311,8 +311,9 @@ Key endpoints:
   lib/
     alertSocketController.ts # connect / backoff / reconnect / resync, outside React
     types.ts                 # snapshot + WS event types, mirrored from the backend schemas
-    consoleState.ts          # the reducer: rows keyed by household_id
+    consoleState.ts          # the reducer: rows keyed by household_id, each with its attempt history
     statusTone.ts            # status → green / amber / red / grey
+    rerouteNarrative.ts      # the same state in words: "SMS failed → retrying via Voice"
     api.ts, env.ts           # GET /alerts/{id}/status; NEXT_PUBLIC_* URLs
   tests/                     # node --test (`npm test`); no test framework installed
 ```
@@ -327,7 +328,9 @@ Key endpoints:
 - `AlertConsole.tsx` is the `"use client"` boundary. It seeds `useReducer` from the snapshot it was handed, so its first client paint is the same grid the server rendered.
 - `lib/consoleState.ts` holds rows in a `Record<household_id, HouseholdRow>` plus a separate `order` array. A `delivery_update` replaces one entry and leaves every other row object identical, so the memoised rows around it do not re-render — on a zone dispatch that is the difference between one row updating and hundreds re-rendering per Twilio callback. `order` is kept apart so a patch never reshuffles the grid.
 - An event for a household the snapshot did not contain is dropped: it joined the zone after the page loaded, and a reconnect resync is what picks it up.
-- `lib/statusTone.ts` is the single place the four colours are decided. Red is read from the household's `last_known_status`, not from any attempt, because "unreached" is a statement about the household after its whole fallback chain ran out (#13).
+- `lib/statusTone.ts` is the single place the four colours are decided. Red is read from the household's `last_known_status`, not from any attempt, because "unreached" is a statement about the household after its whole fallback chain ran out (#13). Amber is any attempt annotated with a fallback, whatever the failing status was called, so a terminal status added to the chain later does not leave a household being retried looking grey.
+- `lib/rerouteNarrative.ts` turns the same row into the sentence beside it — "SMS failed → retrying via Voice", or "All channels tried after 2 attempts — needs human follow-up" (#14). Built from the event payload's `fallback_triggered`/`fallback_channel` rather than from what the console remembers, so a console that connected mid-dispatch prints the same words as one that watched the whole thing. A colour alone is something a dispatcher has to decode under time pressure; that is why the words are required by CLAUDE.md's Frontend Conventions and not left to the palette.
+- `HouseholdRow.attempts` accumulates one entry per `attempt_number`, which `components/DeliveryTimeline.tsx` lists oldest-first in a `<details>` disclosure per household. Attempts accumulate rather than flip in place because a fallback creates a *new* DeliveryAttempt and never mutates the failed one (Domain Rule 2) — a single status changing colour would be a different claim about what happened. A resync keeps the attempts the console already saw and lets the snapshot decide only where the household stands now: an observed attempt is a committed row nothing rewrites, while `GET /alerts/{id}/status` reports one current attempt per household and cannot restore a history.
 - `useAlertSocket.ts` holds its handlers in a ref so a new inline callback per render does not tear the socket down, ignores frames it cannot parse or whose `type` it does not know, and returns the connection state the banner renders from. The lifecycle underneath it lives in `lib/alertSocketController.ts`.
 - `lib/alertSocketController.ts` owns connect → drop → backoff → reconnect → resync, deliberately outside React and outside the browser: the socket, the snapshot fetch and the timer all arrive as arguments, which is what makes the backoff schedule and the resync observable in `frontend/tests/` without a DOM or a live server. Three rules it exists to enforce:
   - **A drop is reported before the retry is waited out**, not after. At the tail of the schedule "after" is half a minute of a console that looks fine and is not.

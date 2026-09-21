@@ -93,20 +93,24 @@ export interface HouseholdUnreachedEvent {
 /**
  * What the console knows how to apply today.
  *
- * `household_unreached` is emitted by the backend (#13) and declared above so
- * the three sides of the contract stay in step, but the socket does not forward
- * it yet — rendering the red "needs a human" row is #14's. `dispatch_started`
- * and `dispatch_complete` are part of the contract and not emitted at all yet.
- * The socket ignores any event type it does not recognise, so all three can
- * land without breaking a console that predates them.
+ * `dispatch_started` and `dispatch_complete` are part of the contract and not
+ * emitted at all yet. The socket ignores any event type it does not recognise,
+ * so both can land without breaking a console that predates them.
  */
-export type AlertSocketEvent = DeliveryUpdateEvent;
+export type AlertSocketEvent = DeliveryUpdateEvent | HouseholdUnreachedEvent;
 
-export function isDeliveryUpdateEvent(value: unknown): value is DeliveryUpdateEvent {
+function hasHouseholdId(value: unknown): value is { type: unknown; household_id: string } {
   return (
     typeof value === "object" &&
     value !== null &&
-    (value as { type?: unknown }).type === "delivery_update" &&
     typeof (value as { household_id?: unknown }).household_id === "string"
   );
+}
+
+export function isDeliveryUpdateEvent(value: unknown): value is DeliveryUpdateEvent {
+  return hasHouseholdId(value) && value.type === "delivery_update";
+}
+
+export function isHouseholdUnreachedEvent(value: unknown): value is HouseholdUnreachedEvent {
+  return hasHouseholdId(value) && value.type === "household_unreached";
 }
