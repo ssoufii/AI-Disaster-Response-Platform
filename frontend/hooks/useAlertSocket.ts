@@ -21,6 +21,7 @@ import { connectAlertSocket, type ConnectionState } from "@/lib/alertSocketContr
 import { WS_BASE_URL } from "@/lib/env";
 import {
   isDeliveryUpdateEvent,
+  isHouseholdUnreachedEvent,
   type AlertSocketEvent,
   type AlertStatusSnapshot,
 } from "@/lib/types";
@@ -52,9 +53,9 @@ export function useAlertSocket(
           // here would take the socket down with it.
           return;
         }
-        // Event types this build predates (`household_unreached` and the
-        // dispatch lifecycle events) are ignored rather than mishandled.
-        if (isDeliveryUpdateEvent(payload)) {
+        // Event types this build predates (the dispatch lifecycle events) are
+        // ignored rather than mishandled.
+        if (isDeliveryUpdateEvent(payload) || isHouseholdUnreachedEvent(payload)) {
           handlers.current.onEvent(payload);
         }
       },

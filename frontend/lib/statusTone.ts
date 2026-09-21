@@ -16,6 +16,7 @@
  */
 
 import type { HouseholdRow } from "@/lib/consoleState";
+import type { DeliveryStatus } from "@/lib/types";
 
 export type StatusTone = "green" | "amber" | "red" | "grey";
 
@@ -27,6 +28,12 @@ export function statusTone(row: HouseholdRow): StatusTone {
   }
   if (row.status === "delivered" || row.status === "confirmed_received") {
     return "green";
+  }
+  // Amber is "failed but still in hand", which is what a fallback annotation
+  // means whatever the failing status was called — the backend can add terminal
+  // statuses to the chain without this going grey on a household being retried.
+  if (row.fallback_triggered) {
+    return "amber";
   }
   if (row.status !== null && FAILED_STATUSES.has(row.status)) {
     return "amber";
@@ -48,6 +55,20 @@ export const TONE_DOT_CLASSES: Record<StatusTone, string> = {
   grey: "bg-slate-400",
 };
 
+/**
+ * The tint on the row itself, for the two tones that ask for attention.
+ *
+ * Only amber and red carry one: a grid where every row is coloured is a grid
+ * where nothing stands out, and the rows that need a dispatcher's eye are the
+ * one being retried and the one waiting on a person.
+ */
+export const TONE_ROW_CLASSES: Record<StatusTone, string> = {
+  green: "",
+  amber: "bg-amber-50/60",
+  red: "bg-red-50",
+  grey: "",
+};
+
 const STATUS_LABELS: Record<string, string> = {
   queued: "Queued",
   sending: "Sending",
@@ -57,6 +78,10 @@ const STATUS_LABELS: Record<string, string> = {
   confirmed_received: "Confirmed received",
 };
 
+export function deliveryStatusLabel(status: DeliveryStatus): string {
+  return STATUS_LABELS[status] ?? status;
+}
+
 export function statusLabel(row: HouseholdRow): string {
   if (row.last_known_status === "unreached") {
     return "Unreached — needs follow-up";
@@ -64,7 +89,7 @@ export function statusLabel(row: HouseholdRow): string {
   if (row.status === null) {
     return "Not attempted";
   }
-  return STATUS_LABELS[row.status] ?? row.status;
+  return deliveryStatusLabel(row.status);
 }
 
 const CHANNEL_LABELS: Record<string, string> = {

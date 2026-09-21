@@ -24,6 +24,12 @@ export function AlertConsole({ snapshot }: { snapshot: AlertStatusSnapshot }) {
   const [state, dispatch] = useReducer(consoleReducer, snapshot, initialConsoleState);
 
   const onEvent = useCallback((event: AlertSocketEvent) => {
+    // The event's own `type` is the action's: both are applied to exactly one
+    // household's row, and the reducer decides what each means for it.
+    if (event.type === "household_unreached") {
+      dispatch({ type: "household_unreached", event });
+      return;
+    }
     dispatch({ type: "delivery_update", event });
   }, []);
 
