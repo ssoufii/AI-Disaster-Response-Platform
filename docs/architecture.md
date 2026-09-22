@@ -370,6 +370,61 @@ CONSOLE_ORIGINS=   # comma-separated console origins allowed to read the API fro
 
 ## Open Design Decisions to Make Early
 
-- **ASL delivery**: pre-recorded human interpreter clips per template message vs. AI avatar generation — affects scope a lot. Starting with a small library of pre-recorded common-phrase clips + Claude only writing captions is far more buildable than generating video.
-- **Confirmation of safety**: do you want two-way interaction (press 1 to confirm safe) in v1, or just delivery confirmation? Two-way is a strong differentiator but adds IVR complexity.
+- **ASL delivery**: pre-recorded human interpreter clips per template message vs. AI avatar generation — affects scope a lot. Starting with a small library of pre-recorded common-phrase clips + Claude only writing captions is far more buildable than generating video. *(Still open — #18.)*
+- **Confirmation of safety**: do you want two-way interaction (press 1 to confirm safe) in v1, or just delivery confirmation? Two-way is a strong differentiator but adds IVR complexity. *(**Decided** — see "Decision: IVR confirmation" below.)*
 - **Zone lookup**: simple zone_id field vs. real geofencing — geofencing is a nice-to-have, not needed for the core loop.
+
+---
+
+## Decision: IVR confirmation
+
+**v1 includes two-way DTMF confirmation.** Voice calls use `<Gather>`, a keypress of `1` is the
+only thing in the system that writes `DeliveryStatus.CONFIRMED_RECEIVED`, and **#17 proceeds as
+scoped** — it is not closed as out of scope. Decided under #15 (time-boxed spike, no production
+code); this note is the whole deliverable.
+
+**Why, given the complexity/value tradeoff:**
+
+- **The content side is already built and already promises it.** Every voice script the system
+  produces ends by asking the household to press 1: the system prompt requires it
+  (`prompts/content_generation.py`), and all three severity fallback templates hard-code it
+  (`prompts/templates.py`). Shipping voice without a gather means placing calls that instruct
+  people to press a key nothing is listening for. That is worse than not asking — a household
+  that pressed 1 believes it has told somebody it is safe, while the console still shows
+  `delivered` and a responder is still planning to go and knock on the door. Delivery-tracking-only
+  would therefore not be a smaller v1; it would be a v1 that has to go back and strip the
+  confirmation prompt out of four generated-content paths.
+- **Domain Rule 6 is inert without it.** `CONFIRMED_RECEIVED` is already in `DeliveryStatus`, and
+  the rule says it may arrive only from explicit human action. With delivery tracking only, no code
+  path can ever reach that value and the rule degrades to "never set this". "Delivery ≠ receipt" is
+  the distinction this system exists to hold; it is worth stating only if the second state is
+  reachable.
+- **The marginal complexity is one TwiML verb and one route.** Voice is being built regardless
+  (#16), so TwiML generation and the call-status path are sunk cost. The delta is a
+  `<Gather numDigits="1" action=...>` around the `<Say>`, plus a gather-result endpoint — and that
+  endpoint reuses machinery that is already built and proven on SMS: signature validation (#8),
+  `(twilio_sid, status)` idempotency (#9), commit-then-broadcast to the console (#10). No new model
+  column, therefore **no migration**; no new dependency; no new external service. The IVR
+  complexity the original note worried about is the interactive *menu* case — branching, retries,
+  speech input — and none of that is in scope: one prompt, one digit, no menu.
+- **It is the console's point.** At zone scale `delivered` says almost nothing about who is safe.
+  A dispatcher triages by finding the households that still need a person, and
+  `confirmed_received` is the only signal that removes a household from that list on the household's
+  own say-so.
+
+**What this decision does not cover:**
+
+- **Voice only.** SMS-reply confirmation — the other human action Domain Rule 6 allows — is not in
+  v1 and has no story. Adding it later is a new story, not a widening of #17.
+- **Silence is never a receipt.** A call that completes with no keypress stays `delivered`, always.
+  Nothing infers confirmation from call duration, answer status or a voicemail pickup.
+- **A confirmation is a status update on the existing attempt, never a new one** (Domain Rule 2),
+  and it is not a terminal failure, so it triggers no fallback.
+- **The split between #16 and #17 stands.** #16 ships call placement, TwiML playback and voice
+  status handling; #17 adds the `<Gather>` and its callback. Between the two merging there is a
+  window where calls say "press 1" and nothing listens — accepted only because #17 follows
+  immediately in the same epic, which is precisely why it is not optional.
+
+**Reversing it** costs nothing but this note while #17 is unstarted: no schema, no config and no
+other story depends on the choice. After #17 merges, reversal also means removing the gather
+callback and the confirmation sentence from the prompt and the templates.
