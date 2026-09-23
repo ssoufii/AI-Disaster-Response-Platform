@@ -229,12 +229,12 @@ async def test_dispatching_twice_does_not_send_a_household_a_second_message(
 async def test_a_channel_that_is_not_yet_built_is_not_attempted(
     client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
 ) -> None:
-    # Voice (#16) and ASL/video (#19) are still ahead in the build order; a
-    # household on one of them gets no attempt rather than an SMS it did not
-    # ask for.
-    alert_id, _ = await _dispatch_one_sms_household(client, preferred_channel="voice")
+    # ASL/video (#19) is still ahead in the build order; a household on it gets
+    # no attempt rather than an SMS it did not ask for.
+    alert_id, _ = await _dispatch_one_sms_household(client, preferred_channel="video")
 
     assert twilio.messages.sent == []
+    assert twilio.calls.placed == []
     assert await _attempts(session, alert_id) == []
 
 
@@ -279,6 +279,307 @@ async def test_one_households_failure_does_not_strand_the_rest_of_the_zone(
     assert body["deliveries_started"] == 2
     statuses = sorted(attempt.status for attempt in await _attempts(session, alert_id))
     assert statuses == ["failed", "queued"]
+
+
+# --- Dispatch: the voice channel ---------------------------------------------
+#
+# The second channel, on the same rails as the first: the row is written before
+# the call is placed, the call carries the same statusCallback, and everything
+# after it — status handling, idempotency, rerouting — is the machinery SMS
+# already proved.
+
+
+async def _dispatch_one_voice_household(
+    client: AsyncClient, phone_number: str = "+15550100501", **overrides: object
+) -> tuple[str, str]:
+    """Draft, dispatch to a voice-first household, and return the two ids."""
+    return await _dispatch_one_sms_household(
+        client, phone_number=phone_number, preferred_channel="voice", **overrides
+    )
+
+
+async def _write_voice_content(
+    session: AsyncSession, alert_id: str, household_id: str, script: str, *, language: str
+) -> None:
+    """Put this household's voice content in place before the reroute finds it.
+
+    The mocked Claude answers in English for every household, so a test about
+    what a call *says* writes the content itself and lets the reroute reuse it.
+    """
+    session.add(
+        AlertContent(
+            alert_id=uuid.UUID(alert_id),
+            household_id=uuid.UUID(household_id),
+            channel="voice",
+            generated_text=script,
+            generated_script=script,
+            video_caption_text=script,
+            language=language,
+        )
+    )
+    await session.commit()
+
+
+async def test_dispatch_places_a_call_and_records_the_first_attempt(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, household_id = await _dispatch_one_voice_household(client)
+
+    assert twilio.messages.sent == []
+    attempts = await _attempts(session, alert_id)
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt.household_id == uuid.UUID(household_id)
+    assert attempt.channel == "voice"
+    assert attempt.attempt_number == 1
+    # Queued, not delivered: Twilio has the call, the household does not yet
+    # have the warning.
+    assert attempt.status == "queued"
+    assert attempt.twilio_sid == twilio.calls.placed[0].sid
+    assert attempt.completed_at is None
+    assert attempt.error_reason is None
+
+
+async def test_a_call_reads_the_generated_voice_script_aloud(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    await _dispatch_one_voice_household(client, phone_number="+15550100502")
+
+    assert len(twilio.calls.placed) == 1
+    params = twilio.calls.placed[0].params
+    assert params["to"] == "+15550100502"
+    assert params["from_"] == TWILIO_PHONE_NUMBER
+    # The voice script, not the SMS text: the same facts, written to be heard.
+    assert f'<Say language="en-US">{SMS_TEXT} Press 1 if you are safe.</Say>' in params["twiml"]
+
+
+async def test_a_call_carries_the_status_callback_and_asks_for_the_progress_events(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    # Without the events named, Twilio reports only the outcome and the console
+    # shows a household sitting at queued for the length of the ring.
+    await _dispatch_one_voice_household(client)
+
+    params = twilio.calls.placed[0].params
+    assert params["status_callback"] == f"{PUBLIC_BASE_URL}/webhooks/twilio/status"
+    assert params["status_callback_method"] == "POST"
+    assert params["status_callback_event"] == ["initiated", "ringing", "answered", "completed"]
+
+
+async def test_a_call_is_spoken_in_the_households_own_language(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # A Spanish warning read by an English voice is barely a warning, so the
+    # language goes to Twilio with the script.
+    alert_id, household_id = await _dispatch_one_sms_household(client, language="es")
+    await _write_voice_content(session, alert_id, household_id, "Evacúe ahora.", language="es")
+
+    await _fail_first_attempt(client, twilio)
+
+    assert '<Say language="es-MX">Evacúe ahora.</Say>' in twilio.calls.placed[0].params["twiml"]
+
+
+async def test_a_regional_language_tag_still_finds_its_voice(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # `language_used` is BCP-47, so Claude may answer with a region this map
+    # does not list. The primary subtag is what picks the voice.
+    alert_id, household_id = await _dispatch_one_sms_household(client, language="es")
+    await _write_voice_content(session, alert_id, household_id, "Evacúe ahora.", language="es-419")
+
+    await _fail_first_attempt(client, twilio)
+
+    assert 'language="es-MX"' in twilio.calls.placed[0].params["twiml"]
+
+
+async def test_a_language_twilio_cannot_speak_is_read_anyway_and_logged(
+    client: AsyncClient,
+    session: AsyncSession,
+    twilio: FakeTwilio,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Somali has no Twilio voice. The call is still placed — a warning read in
+    # the wrong accent beats no warning — and the gap is logged rather than
+    # passing unnoticed.
+    recorder = RecordingLogger()
+    monkeypatch.setattr(delivery_service, "logger", recorder)
+    alert_id, household_id = await _dispatch_one_sms_household(client, language="so")
+    await _write_voice_content(session, alert_id, household_id, "Degdeg u baxa.", language="so")
+
+    await _fail_first_attempt(client, twilio)
+
+    twiml = twilio.calls.placed[0].params["twiml"]
+    assert "<Say>Degdeg u baxa.</Say>" in twiml
+    assert ("warning", "delivery.voice_language_unsupported") in [
+        (level, event) for level, event, _ in recorder.calls
+    ]
+
+
+async def test_a_refused_call_still_leaves_a_failed_attempt_row(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 2 again, on the voice side: the row exists because we tried.
+    twilio.calls.error = RuntimeError("number is unreachable")
+
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    attempts = await _attempts(session, alert_id)
+    assert len(attempts) == 1
+    assert attempts[0].channel == "voice"
+    assert attempts[0].status == "failed"
+    assert attempts[0].twilio_sid is None
+    assert attempts[0].completed_at is not None
+    assert "number is unreachable" in attempts[0].error_reason
+
+
+# --- The status webhook: calls -----------------------------------------------
+
+
+async def _post_call_status(client: AsyncClient, twilio: FakeTwilio, status: str) -> Any:
+    """Report the first call's status the way Twilio's voice callback does."""
+    return await _post_status(client, CallSid=twilio.calls.placed[0].sid, CallStatus=status)
+
+
+async def test_a_calls_progress_moves_the_attempt_without_completing_it(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # A call's dialling, ringing and answered states are all "in flight" to this
+    # system, so the first of them moves the row and the rest are the same state
+    # reported again — which the existing idempotency guard, keyed on the
+    # *mapped* status, already knows what to do with.
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    results = [
+        (await _post_call_status(client, twilio, status)).json()["result"]
+        for status in ("initiated", "ringing", "in-progress")
+    ]
+
+    assert results == ["applied", "duplicate", "duplicate"]
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    # Still in flight: the call has not ended, so nothing is terminal.
+    assert attempt.status == "sending"
+    assert attempt.completed_at is None
+
+
+async def test_a_completed_call_is_delivered_and_never_a_receipt(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 6: the call ran its course, which says the warning was played,
+    # not that a person heard it and is safe. Only a keypress says that (#17).
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    await _post_call_status(client, twilio, "completed")
+
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "delivered"
+    assert attempt.completed_at is not None
+
+
+async def test_a_call_callback_for_an_sms_only_status_is_ignored(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The two channels have separate vocabularies: `undelivered` is a message's
+    # word and means nothing about a call, so it is ignored rather than guessed
+    # at — and the attempt is left exactly where it was.
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    response = await _post_call_status(client, twilio, "undelivered")
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "ignored"
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "queued"
+
+
+async def test_a_retried_call_callback_applies_once(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    first = await _post_call_status(client, twilio, "completed")
+    second = await _post_call_status(client, twilio, "completed")
+
+    assert first.json()["result"] == "applied"
+    assert second.json()["result"] == "duplicate"
+    callbacks = (await session.exec(select(DeliveryStatusCallback))).all()
+    assert [callback.raw_status for callback in callbacks] == ["completed"]
+    assert len(await _attempts(session, alert_id)) == 1
+
+
+@pytest.mark.parametrize("status", ["no-answer", "busy", "failed", "canceled"])
+async def test_a_call_that_never_reached_the_household_reroutes(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio, status: str
+) -> None:
+    # The whole point of extending voice: it plugs into #12's rerouting with no
+    # new fallback code — a call nobody took walks the chain exactly as an
+    # undelivered SMS does.
+    alert_id, _ = await _dispatch_one_voice_household(client, fallback_channel_order=["sms"])
+
+    await _post_call_status(client, twilio, status)
+
+    attempts = await _attempts(session, alert_id)
+    assert [(a.channel, a.attempt_number) for a in attempts] == [("voice", 1), ("sms", 2)]
+    assert attempts[1].twilio_sid == twilio.messages.sent[0].sid
+
+
+@pytest.mark.parametrize("status", ["queued", "initiated", "ringing", "in-progress"])
+async def test_a_call_still_in_progress_never_reroutes(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio, status: str
+) -> None:
+    # A fallback fired while the phone is still ringing races the call it is
+    # giving up on — and calls the household twice about one alert.
+    alert_id, _ = await _dispatch_one_voice_household(client, fallback_channel_order=["sms"])
+
+    await _post_call_status(client, twilio, status)
+
+    assert len(await _attempts(session, alert_id)) == 1
+    assert twilio.messages.sent == []
+
+
+async def test_a_completed_call_never_reroutes(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_voice_household(client, fallback_channel_order=["sms"])
+
+    await _post_call_status(client, twilio, "completed")
+
+    assert len(await _attempts(session, alert_id)) == 1
+
+
+async def test_a_household_whose_call_is_its_last_channel_is_unreached(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 4 reaches the voice channel through the same branch: the chain
+    # ran out on a call nobody answered, so a person has to go there.
+    _, household_id = await _dispatch_one_voice_household(client, fallback_channel_order=[])
+
+    await _post_call_status(client, twilio, "no-answer")
+
+    household = await session.get(Household, uuid.UUID(household_id))
+    assert household is not None
+    await session.refresh(household)
+    assert household.last_known_status == "unreached"
+
+
+async def test_an_sms_failure_reroutes_onto_a_call_that_is_actually_placed(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The default fallback order is ["voice"], and until now that row sat queued
+    # because there was nothing to place. It is now a call.
+    alert_id, _ = await _dispatch_one_sms_household(client)
+
+    await _fail_first_attempt(client, twilio)
+
+    attempts = await _attempts(session, alert_id)
+    assert [(a.channel, a.attempt_number, a.status) for a in attempts] == [
+        ("sms", 1, "failed"),
+        ("voice", 2, "queued"),
+    ]
+    assert len(twilio.calls.placed) == 1
+    assert attempts[1].twilio_sid == twilio.calls.placed[0].sid
 
 
 # --- The status webhook ------------------------------------------------------
@@ -853,15 +1154,17 @@ async def test_a_fallback_onto_sms_is_dispatched_immediately(
 async def test_a_fallback_onto_a_channel_this_build_cannot_send_stays_queued(
     client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
 ) -> None:
-    # The row is created because the chain really did move onto voice; nothing
-    # is sent, because voice is #16. Marking it failed instead would walk the
+    # The row is created because the chain really did move onto video; nothing
+    # is sent, because video is #19. Marking it failed instead would walk the
     # household down its chain for a channel that was never tried.
-    alert_id, _ = await _dispatch_one_sms_household(client)
+    alert_id, _ = await _dispatch_one_sms_household(client, fallback_channel_order=["video"])
 
     await _fail_first_attempt(client, twilio)
 
     assert len(twilio.messages.sent) == 1
+    assert twilio.calls.placed == []
     fallback = (await _attempts(session, alert_id))[1]
+    assert fallback.channel == "video"
     assert fallback.status == "queued"
     assert fallback.twilio_sid is None
 

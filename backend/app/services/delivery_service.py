@@ -32,6 +32,12 @@ Three things shape this module:
    event is pushed asking for a human. Domain Rule 4 calls failing silently
    here the worst possible outcome, and this is the only place that judgement
    is made.
+7. **A channel changes how a send is made, not what happens around it.** SMS
+   hands Twilio a body; voice hands it TwiML that reads the household's
+   ``voice_script`` aloud. Both write their row first, both carry the same
+   ``statusCallback``, and both report back through the same webhook — so the
+   status handling, idempotency and rerouting built for SMS carry over to voice
+   without a second code path.
 """
 
 import uuid
@@ -44,6 +50,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from twilio.http.async_http_client import AsyncTwilioHttpClient
 from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse
 
 from app.config import settings
 from app.db import session_scope
@@ -66,15 +73,34 @@ STATUS_CALLBACK_PATH = "/webhooks/twilio/status"
 FIRST_ATTEMPT = 1
 
 # The statuses that end an attempt in failure and so start a reroute. Twilio's
-# `undelivered` and `failed` both map to FAILED; `no-answer` and `busy` arrive
-# with the voice channel (#16). In-flight statuses — queued, sending, ringing —
-# are deliberately absent: a fallback fired on one of those would race the
-# delivery it is giving up on (CLAUDE.md, Twilio Integration).
+# `undelivered` and `failed` both map to FAILED; a call's `no-answer` and `busy`
+# both map to NO_ANSWER. In-flight statuses — queued, sending, ringing — are
+# deliberately absent: a fallback fired on one of those would race the delivery
+# it is giving up on (CLAUDE.md, Twilio Integration).
 FALLBACK_TRIGGER_STATUSES = frozenset({DeliveryStatus.FAILED, DeliveryStatus.NO_ANSWER})
 
-# Channels this build can actually send on. Voice (#16) and ASL/video (#19) are
-# still ahead in CLAUDE.md's Build Order.
-SENDABLE_CHANNELS = frozenset({Channel.SMS})
+# Channels this build can actually send on. ASL/video (#19) is still ahead in
+# CLAUDE.md's Build Order.
+SENDABLE_CHANNELS = frozenset({Channel.SMS, Channel.VOICE})
+
+# A call reports only `completed` unless the events are asked for by name, and
+# the console is meant to show a call ringing, not jump from queued to its
+# outcome. `answered` arrives as CallStatus `in-progress`.
+VOICE_STATUS_CALLBACK_EVENTS = ["initiated", "ringing", "answered", "completed"]
+
+# The household's language as Twilio's `<Say>` wants it. A warning read aloud by
+# a voice that cannot pronounce it is barely a warning at all, so the language is
+# set explicitly rather than left at Twilio's en-US default.
+#
+# Only the languages this system generates content in are listed. An unlisted
+# language leaves the attribute off — Twilio then reads it in its default
+# voice, which is wrong but audible, and `delivery.voice_language_unsupported`
+# says so in the log rather than letting the gap pass unnoticed.
+VOICE_LANGUAGES = {
+    "en": "en-US",
+    "es": "es-MX",
+    "vi": "vi-VN",
+}
 
 
 @lru_cache
@@ -108,11 +134,11 @@ async def deliver_alert(
     re-dispatching never sends a household the same warning twice — the same
     guarantee content generation already makes about its rows.
 
-    Only SMS is wired up so far; voice (#16) and ASL/video (#19) are still
-    ahead in CLAUDE.md's Build Order. A household on one of those channels is
-    logged and left without an attempt rather than sent something it cannot
-    receive. That is a build-order gap, not Domain Rule 4's ``unreached``, which
-    means an exhausted fallback chain and is issue #13's to set.
+    SMS and voice are wired up; ASL/video (#19) is still ahead in CLAUDE.md's
+    Build Order. A household on that channel is logged and left without an
+    attempt rather than sent something it cannot receive. That is a build-order
+    gap, not Domain Rule 4's ``unreached``, which means an exhausted fallback
+    chain and is issue #13's to set.
     """
     log = logger.bind(alert_id=str(alert.id))
 
@@ -217,13 +243,17 @@ async def _send(
 ) -> None:
     """Send a recorded attempt on its own channel.
 
-    Only SMS is wired up; a row on a channel that is not (a fallback onto voice,
-    say) stays ``queued`` and is logged. It is deliberately not marked failed:
-    nothing was tried, so calling it a failure would walk the household down its
-    fallback chain for a channel this build simply has not built yet.
+    SMS and voice are wired up; a row on a channel that is not (a fallback onto
+    video, say) stays ``queued`` and is logged. It is deliberately not marked
+    failed: nothing was tried, so calling it a failure would walk the household
+    down its fallback chain for a channel this build simply has not built yet.
     """
-    if Channel(attempt.channel) is Channel.SMS:
+    channel = Channel(attempt.channel)
+    if channel is Channel.SMS:
         await _send_sms(session, alert, household, attempt, content)
+        return
+    if channel is Channel.VOICE:
+        await _send_voice(session, alert, household, attempt, content)
         return
 
     logger.bind(alert_id=str(alert.id), household_id=str(household.id)).warning(
@@ -240,9 +270,7 @@ async def _send_sms(
     attempt: DeliveryAttempt,
     content: AlertContent,
 ) -> DeliveryAttempt:
-    """Hand one recorded attempt to Twilio. Never raises."""
-    log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
-
+    """Hand one recorded attempt to Twilio as a message. Never raises."""
     try:
         message = await get_client().messages.create_async(
             to=household.phone_number,
@@ -251,37 +279,140 @@ async def _send_sms(
             status_callback=status_callback_url(),
         )
     except Exception as exc:
-        # Deliberately broad: an auth error, an unroutable number and a timeout
-        # all mean the same thing to this household — this channel did not take
-        # the message — and all of them belong on the row rather than raising
-        # into the dispatch loop and stranding the households after it.
-        _mark_failed(attempt, f"{type(exc).__name__}: {exc}")
-        session.add(attempt)
-        await session.commit()
-        log.warning(
-            "delivery.send_failed",
-            channel=Channel.SMS.value,
-            attempt_number=attempt.attempt_number,
-            to=redact_phone(household.phone_number),
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
-        # Twilio never accepted this message, so it will never call back about
-        # it. This broadcast is the only way the failure reaches the console.
-        await dispatcher_ws.broadcast_delivery_update(attempt)
+        await _record_refused_send(session, alert, household, attempt, exc)
         return attempt
 
-    attempt.twilio_sid = message.sid
+    await _record_accepted_send(session, alert, household, attempt, message.sid)
+    return attempt
+
+
+async def _send_voice(
+    session: AsyncSession,
+    alert: Alert,
+    household: Household,
+    attempt: DeliveryAttempt,
+    content: AlertContent,
+) -> DeliveryAttempt:
+    """Place the call that reads one recorded attempt aloud. Never raises.
+
+    The TwiML is handed to Twilio inline rather than fetched from a URL of ours:
+    the script is already written and sitting in the row, so an endpoint that
+    served it back would be a second public surface to authenticate for no gain.
+    (#17's ``<Gather>`` needs a callback URL for the keypress, which is a
+    different thing — an answer coming *in*, not a script going out.)
+
+    Call statuses are asked for by name, because Twilio otherwise reports only
+    the outcome and a console watching a dispatch would show a household sitting
+    at ``queued`` for the length of the ring.
+    """
+    try:
+        call = await get_client().calls.create_async(
+            to=household.phone_number,
+            from_=settings.TWILIO_PHONE_NUMBER,
+            twiml=_voice_twiml(alert, household, content),
+            status_callback=status_callback_url(),
+            status_callback_event=VOICE_STATUS_CALLBACK_EVENTS,
+            status_callback_method="POST",
+        )
+    except Exception as exc:
+        await _record_refused_send(session, alert, household, attempt, exc)
+        return attempt
+
+    await _record_accepted_send(session, alert, household, attempt, call.sid)
+    return attempt
+
+
+def _voice_twiml(alert: Alert, household: Household, content: AlertContent) -> str:
+    """The TwiML that reads this household's voice script down the line.
+
+    ``generated_script`` and not ``generated_text``: the SMS text is written to
+    be read with the eyes, and the voice script is the same facts written to be
+    heard — which is why a fallback onto voice generates its own content rather
+    than reusing what was sent by SMS.
+
+    Nothing is composed here beyond the language: the script is Claude's output
+    verbatim, and appending to it would be this module inventing words into an
+    alert (Domain Rule 1).
+    """
+    response = VoiceResponse()
+    language = _twilio_say_language(content.language)
+    if language is None:
+        logger.warning(
+            "delivery.voice_language_unsupported",
+            alert_id=str(alert.id),
+            household_id=str(household.id),
+            language=content.language,
+        )
+        response.say(content.generated_script)
+    else:
+        response.say(content.generated_script, language=language)
+    return str(response)
+
+
+def _twilio_say_language(language: str) -> str | None:
+    """``VOICE_LANGUAGES`` for a BCP-47 tag, or ``None`` if there is no voice.
+
+    ``language_used`` is BCP-47, so it can carry a region Claude chose
+    (``es-419``) that this map does not list. The primary subtag is what picks
+    the voice, and falling back to it is the difference between a Spanish
+    warning read in Spanish and one read in English.
+    """
+    return VOICE_LANGUAGES.get(language) or VOICE_LANGUAGES.get(language.split("-")[0].lower())
+
+
+async def _record_refused_send(
+    session: AsyncSession,
+    alert: Alert,
+    household: Household,
+    attempt: DeliveryAttempt,
+    exc: Exception,
+) -> None:
+    """Record a send Twilio would not take, on the row and on the console.
+
+    The caller catches deliberately broadly: an auth error, an unroutable number
+    and a timeout all mean the same thing to this household — this channel did
+    not take the warning — and all of them belong on the row rather than raising
+    into the dispatch loop and stranding the households after it.
+    """
+    _mark_failed(attempt, f"{type(exc).__name__}: {exc}")
     session.add(attempt)
     await session.commit()
-    log.info(
-        "delivery.sent",
-        channel=Channel.SMS.value,
+    logger.bind(alert_id=str(alert.id), household_id=str(household.id)).warning(
+        "delivery.send_failed",
+        channel=attempt.channel,
         attempt_number=attempt.attempt_number,
         to=redact_phone(household.phone_number),
-        twilio_sid=message.sid,
+        error_type=type(exc).__name__,
+        error=str(exc),
     )
-    return attempt
+    # Twilio never accepted this send, so it will never call back about it. This
+    # broadcast is the only way the failure reaches the console.
+    await dispatcher_ws.broadcast_delivery_update(attempt)
+
+
+async def _record_accepted_send(
+    session: AsyncSession,
+    alert: Alert,
+    household: Household,
+    attempt: DeliveryAttempt,
+    twilio_sid: str,
+) -> None:
+    """Store the SID Twilio answered with — the handle every callback quotes.
+
+    The attempt stays ``queued``: Twilio took it, which is not the same as the
+    household receiving it, and certainly not the same as the household reading
+    or hearing it (Domain Rule 6). What happens next arrives by webhook.
+    """
+    attempt.twilio_sid = twilio_sid
+    session.add(attempt)
+    await session.commit()
+    logger.bind(alert_id=str(alert.id), household_id=str(household.id)).info(
+        "delivery.sent",
+        channel=attempt.channel,
+        attempt_number=attempt.attempt_number,
+        to=redact_phone(household.phone_number),
+        twilio_sid=twilio_sid,
+    )
 
 
 async def reroute_failed_attempt(attempt_id: uuid.UUID) -> None:
