@@ -77,9 +77,38 @@ class FakeMessages:
         return message
 
 
+class PlacedCall:
+    """A call Twilio was asked to place, and the SID it answered with."""
+
+    def __init__(self, sid: str, params: dict[str, Any]) -> None:
+        self.sid = sid
+        self.params = params
+
+
+class FakeCalls:
+    """Twilio's ``client.calls``, recording instead of dialling.
+
+    The voice twin of ``FakeMessages``, down to ``error``: a call Twilio refuses
+    outright is the same path as a message it refuses, and a test can exercise
+    it here without a phone line.
+    """
+
+    def __init__(self) -> None:
+        self.placed: list[PlacedCall] = []
+        self.error: Exception | None = None
+
+    async def create_async(self, **params: Any) -> PlacedCall:
+        if self.error is not None:
+            raise self.error
+        call = PlacedCall(sid=f"CA{len(self.placed):032d}", params=params)
+        self.placed.append(call)
+        return call
+
+
 class FakeTwilio:
     def __init__(self) -> None:
         self.messages = FakeMessages()
+        self.calls = FakeCalls()
 
 
 @pytest.fixture(autouse=True)

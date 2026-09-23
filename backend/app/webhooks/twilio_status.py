@@ -4,6 +4,11 @@ Twilio posts here on every delivery state change; this is the only way the
 system learns whether a warning actually landed. Polling Twilio for status is
 never an option — the console's liveness comes from these callbacks.
 
+Messages and calls both report here. What a message says (``MessageSid``,
+``delivered``) and what a call says (``CallSid``, ``completed``) differ only in
+wording, and that difference stops at ``_identify_callback``; everything after it
+is the same work whatever was sent.
+
 The handler does the least work that can be done: look the attempt up by the SID
 Twilio quotes, apply the status, return 200. Nothing slow belongs here — no
 Claude generation, no outbound send — because Twilio times the callback out and
@@ -57,9 +62,7 @@ logger = structlog.get_logger(__name__)
 # here.
 SIGNATURE_HEADER = "X-Twilio-Signature"
 
-# Twilio's message statuses, mapped onto ours. Voice adds `ringing`,
-# `in-progress`, `completed`, `no-answer` and `busy`; those arrive with the
-# voice channel (#16) and are deliberately absent rather than guessed at here.
+# Twilio's message statuses, mapped onto ours.
 #
 # `sent` is Twilio's "handed to the carrier" — still in flight toward
 # `delivered`, so it is not terminal and is not a receipt.
@@ -71,6 +74,33 @@ MESSAGE_STATUS_MAP = {
     "sent": DeliveryStatus.SENDING,
     "delivered": DeliveryStatus.DELIVERED,
     "undelivered": DeliveryStatus.FAILED,
+    "failed": DeliveryStatus.FAILED,
+}
+
+# Twilio's call statuses, mapped onto the same ones. A call progresses
+# `queued` → `initiated` → `ringing` → `in-progress` → an outcome, so everything
+# before the outcome is this system's "in flight".
+#
+# `completed` is the call having run its course — Twilio delivered the warning
+# to whoever or whatever picked up. It is `delivered`, never
+# `confirmed_received`: a call that was answered and heard out is still not a
+# person saying they are safe, and only a keypress can say that (#17, Domain
+# Rule 6).
+#
+# `busy` and `no-answer` are both the household not taking the call, which is
+# what `NO_ANSWER` means and why they share it; Twilio's own word for each is
+# kept verbatim on the `DeliveryStatusCallback` row. `canceled` is a call
+# abandoned before it connected, which is a failure of this attempt like any
+# other. Both outcomes are terminal failures, so both reroute (#12).
+CALL_STATUS_MAP = {
+    "queued": DeliveryStatus.QUEUED,
+    "initiated": DeliveryStatus.SENDING,
+    "ringing": DeliveryStatus.SENDING,
+    "in-progress": DeliveryStatus.SENDING,
+    "completed": DeliveryStatus.DELIVERED,
+    "busy": DeliveryStatus.NO_ANSWER,
+    "no-answer": DeliveryStatus.NO_ANSWER,
+    "canceled": DeliveryStatus.FAILED,
     "failed": DeliveryStatus.FAILED,
 }
 
@@ -143,13 +173,11 @@ async def twilio_status(
     session: AsyncSession = Depends(get_session),
 ) -> TwilioStatusAck:
     """Apply one Twilio status callback to its DeliveryAttempt."""
-    # `SmsSid`/`SmsStatus` are Twilio's older aliases; both are still sent.
-    twilio_sid = params.get("MessageSid") or params.get("SmsSid")
-    raw_status = params.get("MessageStatus") or params.get("SmsStatus")
-
-    if not twilio_sid or not raw_status:
+    identified = _identify_callback(params)
+    if identified is None:
         logger.warning("twilio_status.malformed_callback", fields=sorted(params))
         return TwilioStatusAck(result="ignored", reason="missing sid or status")
+    twilio_sid, raw_status, status_map = identified
 
     attempt = (
         await session.exec(select(DeliveryAttempt).where(DeliveryAttempt.twilio_sid == twilio_sid))
@@ -163,7 +191,7 @@ async def twilio_status(
 
     log = logger.bind(alert_id=str(attempt.alert_id), household_id=str(attempt.household_id))
 
-    status = MESSAGE_STATUS_MAP.get(raw_status)
+    status = status_map.get(raw_status)
     if status is None:
         log.warning(
             "twilio_status.unmapped_status",
@@ -225,6 +253,34 @@ async def twilio_status(
         )
 
     return TwilioStatusAck(result="applied", status=status)
+
+
+def _identify_callback(
+    params: dict[str, str],
+) -> tuple[str, str, dict[str, DeliveryStatus]] | None:
+    """Which send this callback is about, and which vocabulary it speaks.
+
+    One endpoint serves both channels, because everything after this line — the
+    lookup by SID, the idempotency guard, the broadcast, the reroute — is the
+    same work whatever was sent. What differs is only the field names Twilio
+    uses and the status words it puts in them, and that difference stops here.
+
+    A message and a call never share a callback, so the two are told apart by
+    which fields arrived. Messages are checked first, and `SmsSid`/`SmsStatus`
+    are Twilio's older aliases for them; both are still sent. ``None`` means
+    neither pair was present.
+    """
+    message_sid = params.get("MessageSid") or params.get("SmsSid")
+    message_status = params.get("MessageStatus") or params.get("SmsStatus")
+    if message_sid and message_status:
+        return message_sid, message_status, MESSAGE_STATUS_MAP
+
+    call_sid = params.get("CallSid")
+    call_status = params.get("CallStatus")
+    if call_sid and call_status:
+        return call_sid, call_status, CALL_STATUS_MAP
+
+    return None
 
 
 async def _record_callback(
