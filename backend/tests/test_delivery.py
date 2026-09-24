@@ -28,6 +28,7 @@ from app.services import content_generator, delivery_service
 from app.webhooks import twilio_status
 from scripts.seed import TWILIO_UNDELIVERABLE_SMS_NUMBER, seed_demo_data
 from tests.conftest import (
+    GATHER_CALLBACK_URL,
     PUBLIC_BASE_URL,
     TWILIO_AUTH_TOKEN,
     TWILIO_PHONE_NUMBER,
@@ -580,6 +581,230 @@ async def test_an_sms_failure_reroutes_onto_a_call_that_is_actually_placed(
     ]
     assert len(twilio.calls.placed) == 1
     assert attempts[1].twilio_sid == twilio.calls.placed[0].sid
+
+
+# --- The voice confirmation keypress -----------------------------------------
+#
+# Domain Rule 6, made reachable: `delivered` is Twilio's word for a call that
+# ran its course, and `confirmed_received` is a household's own. Only the
+# keypress below writes the second, and nothing walks the first up into it.
+
+
+async def _post_confirmation(client: AsyncClient, twilio: FakeTwilio, **params: str) -> Any:
+    """POST a gather result the way Twilio does: signed against its own URL."""
+    params = {"CallSid": twilio.calls.placed[0].sid} | params
+    return await client.post(
+        "/webhooks/twilio/voice-confirmation",
+        data=params,
+        headers=twilio_signed_headers(params, url=GATHER_CALLBACK_URL),
+    )
+
+
+async def test_a_call_gathers_the_keypress_its_own_script_asks_for(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    # Every script ends with "press 1", so the call has to be listening for it —
+    # otherwise it instructs a household to press a key nothing reads.
+    await _dispatch_one_voice_household(client)
+
+    twiml = twilio.calls.placed[0].params["twiml"]
+    assert f'action="{PUBLIC_BASE_URL}/webhooks/twilio/voice-confirmation"' in twiml
+    assert 'input="dtmf"' in twiml
+    assert 'numDigits="1"' in twiml
+    assert 'method="POST"' in twiml
+    # The script is read *inside* the gather: a household that already knows it
+    # is safe can answer without hearing the rest of the warning out.
+    assert "<Gather" in twiml.split("<Say")[0]
+
+
+async def test_pressing_one_confirms_the_household_heard_the_warning(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    response = await _post_confirmation(client, twilio, Digits="1")
+
+    assert response.status_code == 200
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "confirmed_received"
+    # A household that has answered is waiting on nothing further.
+    assert attempt.completed_at is not None
+
+
+async def test_a_confirmation_updates_the_attempt_rather_than_adding_one(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 2 cuts both ways: a reroute is a new row, and a confirmation —
+    # which is this same attempt still — is not.
+    alert_id, _ = await _dispatch_one_voice_household(client, fallback_channel_order=["sms"])
+    before = (await _attempts(session, alert_id))[0]
+
+    await _post_confirmation(client, twilio, Digits="1")
+
+    attempts = await _attempts(session, alert_id)
+    assert [(a.id, a.channel, a.attempt_number) for a in attempts] == [
+        (before.id, "voice", 1),
+    ]
+    # And it is not a failure, so nothing is rerouted onto the next channel.
+    assert twilio.messages.sent == []
+
+
+async def test_a_call_nobody_answered_the_prompt_on_stays_delivered(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Silence is never a receipt. Twilio normally does not even post an empty
+    # gather; this is the endpoint refusing to infer one if it does.
+    alert_id, _ = await _dispatch_one_voice_household(client)
+    await _post_call_status(client, twilio, "completed")
+
+    await _post_confirmation(client, twilio, Digits="")
+
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "delivered"
+
+
+async def test_a_digit_that_is_not_the_one_asked_for_confirms_nothing(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # A household reaching for the keypad and missing has not told anyone it is
+    # safe.
+    alert_id, _ = await _dispatch_one_voice_household(client)
+    await _post_call_status(client, twilio, "completed")
+
+    await _post_confirmation(client, twilio, Digits="9")
+
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "delivered"
+
+
+async def test_a_retried_confirmation_is_recorded_once(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Twilio retries this callback like any other, and a household can press 1
+    # twice. Both are one event, through the same (sid, status) guard.
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    await _post_confirmation(client, twilio, Digits="1")
+    await _post_confirmation(client, twilio, Digits="1")
+
+    callbacks = (await session.exec(select(DeliveryStatusCallback))).all()
+    assert [callback.status for callback in callbacks] == ["confirmed_received"]
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "confirmed_received"
+
+
+async def test_the_call_ending_after_a_confirmation_does_not_undo_it(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The ordinary sequence, not an edge case: the keypress arrives mid-call and
+    # Twilio reports `completed` once the call is over. Applying it would write
+    # `delivered` over the one fact in this system that came from a person.
+    alert_id, _ = await _dispatch_one_voice_household(client)
+    await _post_confirmation(client, twilio, Digits="1")
+
+    response = await _post_call_status(client, twilio, "completed")
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "ignored"
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "confirmed_received"
+
+
+async def test_a_failure_reported_after_a_confirmation_reroutes_nobody(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # A household that has said it is safe is not called again on the next
+    # channel because the call it said it on then dropped.
+    alert_id, _ = await _dispatch_one_voice_household(client, fallback_channel_order=["sms"])
+    await _post_confirmation(client, twilio, Digits="1")
+
+    await _post_call_status(client, twilio, "no-answer")
+
+    assert len(await _attempts(session, alert_id)) == 1
+    assert twilio.messages.sent == []
+
+
+async def test_a_confirmation_for_an_unknown_call_is_ignored(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    response = await _post_confirmation(client, twilio, CallSid="CAnot-ours", Digits="1")
+
+    assert response.status_code == 200
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "queued"
+
+
+async def test_a_confirmation_missing_its_call_sid_is_ignored(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    params = {"Digits": "1"}
+    response = await client.post(
+        "/webhooks/twilio/voice-confirmation",
+        data=params,
+        headers=twilio_signed_headers(params, url=GATHER_CALLBACK_URL),
+    )
+
+    assert response.status_code == 200
+
+
+async def test_the_confirmation_endpoint_answers_twilio_with_twiml(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    # Twilio plays back whatever the gather's action URL returns, so it has to
+    # be TwiML. An empty response ends a call whose warning has been read and
+    # answered; anything said here would be words this system composed into it.
+    await _dispatch_one_voice_household(client)
+
+    response = await _post_confirmation(client, twilio, Digits="1")
+
+    assert response.headers["content-type"].startswith("application/xml")
+    assert response.text == '<?xml version="1.0" encoding="UTF-8"?><Response />'
+
+
+async def test_an_unsigned_confirmation_is_refused(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The endpoint that can mark a household safe is public, so a forged
+    # keypress is exactly what the signature check is here to stop.
+    alert_id, _ = await _dispatch_one_voice_household(client)
+
+    response = await client.post(
+        "/webhooks/twilio/voice-confirmation",
+        data={"CallSid": twilio.calls.placed[0].sid, "Digits": "1"},
+    )
+
+    assert response.status_code == 403
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "queued"
+
+
+async def test_a_confirmation_signed_against_the_status_url_is_refused(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Each endpoint's signature covers its own URL. A callback signed for the
+    # status webhook is not a callback for this one.
+    alert_id, _ = await _dispatch_one_voice_household(client)
+    params = {"CallSid": twilio.calls.placed[0].sid, "Digits": "1"}
+
+    response = await client.post(
+        "/webhooks/twilio/voice-confirmation",
+        data=params,
+        headers=twilio_signed_headers(params),
+    )
+
+    assert response.status_code == 403
+    attempt = (await _attempts(session, alert_id))[0]
+    await session.refresh(attempt)
+    assert attempt.status == "queued"
 
 
 # --- The status webhook ------------------------------------------------------

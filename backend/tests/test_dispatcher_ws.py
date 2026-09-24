@@ -24,7 +24,7 @@ from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import Channel, DeliveryStatus
 from app.schemas.ws_events import DeliveryUpdateEvent
 from app.services import content_generator, dispatcher_ws
-from tests.conftest import FakeTwilio, twilio_signed_headers
+from tests.conftest import GATHER_CALLBACK_URL, FakeTwilio, twilio_signed_headers
 
 SMS_TEXT = "Evacuate now. Go to Lincoln High School, 400 Oak St."
 
@@ -228,27 +228,23 @@ async def _alert(client: AsyncClient, zone_id: str) -> str:
     ).json()["id"]
 
 
-async def _household(client: AsyncClient, zone_id: str) -> str:
-    return (
-        await client.post(
-            "/households",
-            json={
-                "name": "Baker household",
-                "phone_number": "+15550100001",
-                "language": "en",
-                "preferred_channel": "sms",
-                "fallback_channel_order": ["voice"],
-                "zone_id": zone_id,
-            },
-        )
-    ).json()["id"]
+async def _household(client: AsyncClient, zone_id: str, **overrides: object) -> str:
+    payload: dict[str, object] = {
+        "name": "Baker household",
+        "phone_number": "+15550100001",
+        "language": "en",
+        "preferred_channel": "sms",
+        "fallback_channel_order": ["voice"],
+        "zone_id": zone_id,
+    }
+    return (await client.post("/households", json=payload | overrides)).json()["id"]
 
 
-async def _dispatch(client: AsyncClient) -> tuple[str, str]:
+async def _dispatch(client: AsyncClient, **overrides: object) -> tuple[str, str]:
     """Draft, dispatch, and return ``(alert_id, household_id)``."""
     zone_id = await _zone(client)
     alert_id = await _alert(client, zone_id)
-    household_id = await _household(client, zone_id)
+    household_id = await _household(client, zone_id, **overrides)
     await client.post(f"/alerts/{alert_id}/dispatch")
     return alert_id, household_id
 
@@ -350,6 +346,75 @@ async def test_an_unplaceable_callback_pushes_nothing(
     await _post_status(client, MessageSid="SMnot-ours", MessageStatus="delivered")
 
     assert console.sent == []
+
+
+# --- Broadcast from the confirmation webhook ----------------------------------
+
+
+async def _post_confirmation(client: AsyncClient, twilio: FakeTwilio, digits: str) -> Any:
+    params = {"CallSid": twilio.calls.placed[0].sid, "Digits": digits}
+    return await client.post(
+        "/webhooks/twilio/voice-confirmation",
+        data=params,
+        headers=twilio_signed_headers(params, url=GATHER_CALLBACK_URL),
+    )
+
+
+async def test_a_keypress_reaches_the_console_as_its_own_status(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    # The event a dispatcher is actually waiting for: this household has said it
+    # is safe, so it drops off the list of people someone has to go and find.
+    alert_id, household_id = await _dispatch(client, preferred_channel="voice")
+    console = await _watch(manager, alert_id)
+
+    await _post_confirmation(client, twilio, "1")
+
+    assert len(console.sent) == 1
+    event = console.sent[0]
+    assert event["type"] == "delivery_update"
+    assert event["household_id"] == household_id
+    assert event["channel"] == Channel.VOICE.value
+    assert event["status"] == DeliveryStatus.CONFIRMED_RECEIVED.value
+    assert event["attempt_number"] == 1
+    assert event["fallback_triggered"] is False
+
+
+async def test_a_gather_with_no_keypress_in_it_pushes_nothing(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch(client, preferred_channel="voice")
+    console = await _watch(manager, alert_id)
+
+    await _post_confirmation(client, twilio, "")
+
+    assert console.sent == []
+
+
+async def test_a_retried_confirmation_does_not_push_a_second_event(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch(client, preferred_channel="voice")
+    console = await _watch(manager, alert_id)
+
+    await _post_confirmation(client, twilio, "1")
+    await _post_confirmation(client, twilio, "1")
+
+    assert len(console.sent) == 1
+
+
+async def test_the_call_ending_after_a_confirmation_pushes_no_second_event(
+    client: AsyncClient, manager: dispatcher_ws.ConnectionManager, twilio: FakeTwilio
+) -> None:
+    # Otherwise the console would watch a household go from confirmed back to
+    # delivered as the call it confirmed on hung up.
+    alert_id, _ = await _dispatch(client, preferred_channel="voice")
+    console = await _watch(manager, alert_id)
+    await _post_confirmation(client, twilio, "1")
+
+    await _post_status(client, CallSid=twilio.calls.placed[0].sid, CallStatus="completed")
+
+    assert [event["status"] for event in console.sent] == [DeliveryStatus.CONFIRMED_RECEIVED.value]
 
 
 # --- Broadcast from a fallback reroute ----------------------------------------

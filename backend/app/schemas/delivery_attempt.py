@@ -42,7 +42,10 @@ class TwilioStatusAck(BaseModel):
 
     ``result`` is ``applied`` when the attempt was updated, ``duplicate`` when
     Twilio had already reported this state and the callback changed nothing, and
-    ``ignored`` when the callback could not be placed at all.
+    ``ignored`` when the callback was not applied to an attempt — because it
+    could not be placed at all, or because the attempt is already
+    ``confirmed_received`` and a delivery status may never be written over a
+    household's own word (Domain Rule 6).
 
     Always returned with a 200: Twilio retries anything else, and neither a
     callback we cannot place nor one we have already applied is helped by a
