@@ -38,6 +38,12 @@ Three things shape this module:
    ``statusCallback``, and both report back through the same webhook — so the
    status handling, idempotency and rerouting built for SMS carry over to voice
    without a second code path.
+8. **A call listens for the keypress its own script asks for.** Every voice
+   script ends by asking the household to press 1, so the ``<Say>`` is wrapped
+   in a ``<Gather>`` whose result posts to the confirmation webhook. That
+   keypress is the only thing in the system that can write
+   ``confirmed_received`` (Domain Rule 6); nothing here infers it from a call
+   being answered or heard out.
 """
 
 import uuid
@@ -67,6 +73,11 @@ logger = structlog.get_logger(__name__)
 # Where Twilio posts every delivery state change. Absolute, because Twilio
 # resolves it from the public internet, not from inside this process.
 STATUS_CALLBACK_PATH = "/webhooks/twilio/status"
+
+# Where Twilio posts the digit a household pressed during a call. A separate
+# endpoint from the status callback because it carries a different fact: the
+# status callback says what happened to the call, this says what a person did.
+GATHER_CALLBACK_PATH = "/webhooks/twilio/voice-confirmation"
 
 # A household's preferred channel is attempt 1; each fallback increments from
 # there.
@@ -102,6 +113,17 @@ VOICE_LANGUAGES = {
     "vi": "vi-VN",
 }
 
+# The digit every generated script and every fallback template asks for, and the
+# only one that means "I am safe". Anything else pressed is not a confirmation.
+CONFIRMATION_DIGIT = "1"
+
+# One digit, and seconds to press it. The gather is a single question, not a
+# menu: there is nothing to key in beyond the answer the script asked for. The
+# wait is longer than Twilio's five-second default because the household it is
+# waiting on has just been told to evacuate.
+CONFIRMATION_NUM_DIGITS = 1
+CONFIRMATION_TIMEOUT_SECONDS = 10
+
 
 @lru_cache
 def get_client() -> Client:
@@ -123,6 +145,11 @@ def get_client() -> Client:
 def status_callback_url() -> str:
     """The absolute URL Twilio posts delivery status to."""
     return f"{settings.PUBLIC_BASE_URL.rstrip('/')}{STATUS_CALLBACK_PATH}"
+
+
+def gather_callback_url() -> str:
+    """The absolute URL Twilio posts a call's keypress to."""
+    return f"{settings.PUBLIC_BASE_URL.rstrip('/')}{GATHER_CALLBACK_PATH}"
 
 
 async def deliver_alert(
@@ -298,7 +325,7 @@ async def _send_voice(
     The TwiML is handed to Twilio inline rather than fetched from a URL of ours:
     the script is already written and sitting in the row, so an endpoint that
     served it back would be a second public surface to authenticate for no gain.
-    (#17's ``<Gather>`` needs a callback URL for the keypress, which is a
+    (The ``<Gather>`` does need a callback URL for the keypress, which is a
     different thing — an answer coming *in*, not a script going out.)
 
     Call statuses are asked for by name, because Twilio otherwise reports only
@@ -333,8 +360,27 @@ def _voice_twiml(alert: Alert, household: Household, content: AlertContent) -> s
     Nothing is composed here beyond the language: the script is Claude's output
     verbatim, and appending to it would be this module inventing words into an
     alert (Domain Rule 1).
+
+    The ``<Say>`` sits *inside* a ``<Gather>`` because the script it reads ends
+    by asking the household to press 1, and a household that already knows it is
+    safe should not have to hear the rest of the warning out before it can
+    answer. What comes back from that keypress is the only receipt this system
+    recognises (#17, Domain Rule 6).
+
+    Nothing follows the gather. A household that presses nothing simply reaches
+    the end of the call, which Twilio reports as ``completed`` and this system
+    records as ``delivered`` — silence is never walked upward into a
+    confirmation, and with ``actionOnEmptyResult`` left off, it does not even
+    reach the confirmation endpoint.
     """
     response = VoiceResponse()
+    gather = response.gather(
+        input="dtmf",
+        num_digits=CONFIRMATION_NUM_DIGITS,
+        timeout=CONFIRMATION_TIMEOUT_SECONDS,
+        action=gather_callback_url(),
+        method="POST",
+    )
     language = _twilio_say_language(content.language)
     if language is None:
         logger.warning(
@@ -343,10 +389,22 @@ def _voice_twiml(alert: Alert, household: Household, content: AlertContent) -> s
             household_id=str(household.id),
             language=content.language,
         )
-        response.say(content.generated_script)
+        gather.say(content.generated_script)
     else:
-        response.say(content.generated_script, language=language)
+        gather.say(content.generated_script, language=language)
     return str(response)
+
+
+def confirmation_ack_twiml() -> str:
+    """What the confirmation endpoint answers Twilio with: nothing to say.
+
+    Twilio expects TwiML back from a gather's ``action`` URL and plays whatever
+    it is given. An empty response ends the call, which is the right end to one:
+    the warning has been read and the household has answered it. Saying anything
+    further would be this module composing words into a call whose content is
+    Claude's (Domain Rule 1) — and in one language, into calls placed in three.
+    """
+    return str(VoiceResponse())
 
 
 def _twilio_say_language(language: str) -> str | None:

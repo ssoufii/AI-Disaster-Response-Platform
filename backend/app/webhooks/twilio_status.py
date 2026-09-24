@@ -1,8 +1,15 @@
-"""Twilio delivery status callbacks.
+"""Twilio delivery callbacks: what happened to a send, and what a person did.
 
 Twilio posts here on every delivery state change; this is the only way the
 system learns whether a warning actually landed. Polling Twilio for status is
 never an option — the console's liveness comes from these callbacks.
+
+Two endpoints, and the difference between them is Domain Rule 6. The status
+callback reports what became of a send: a message the carrier took, a call that
+rang out. The confirmation callback carries a digit a household pressed during
+that call, which is a person saying they are safe — the only thing in this
+system that writes ``confirmed_received``, and never something a delivery status
+is allowed to imply.
 
 Messages and calls both report here. What a message says (``MessageSid``,
 ``delivered``) and what a call says (``CallSid``, ``completed``) differ only in
@@ -20,13 +27,13 @@ as a background task and generates and sends on its own time. That task is the
 only trigger rerouting has — nothing polls Twilio or sweeps the table for failed
 attempts (CLAUDE.md, Domain Rule 3).
 
-Twilio reaches this endpoint from the public internet, so it cannot be
-authenticated the way the rest of the API is. What stands in its place is the
+Twilio reaches both endpoints from the public internet, so neither can be
+authenticated the way the rest of the API is. What stands in their place is the
 signature check below: every callback must carry an ``X-Twilio-Signature`` that
 only the account's auth token can produce, or it is refused with a 403 before a
 single row is read. Without it, anyone who found the URL could post forged
-delivery state into the audit trail — or trigger rerouting against real
-households.
+delivery state into the audit trail — or a forged keypress marking a household
+safe that nobody has heard from.
 
 The handler is also idempotent, because Twilio retries any callback it does not
 get a timely 200 for. Each state Twilio reports is recorded as a
@@ -39,7 +46,7 @@ from datetime import UTC, datetime
 from urllib.parse import parse_qsl
 
 import structlog
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -52,7 +59,12 @@ from app.models.delivery_status_callback import DeliveryStatusCallback
 from app.models.enums import DeliveryStatus
 from app.schemas.delivery_attempt import TwilioStatusAck
 from app.services import delivery_service, dispatcher_ws
-from app.services.delivery_service import FALLBACK_TRIGGER_STATUSES, status_callback_url
+from app.services.delivery_service import (
+    CONFIRMATION_DIGIT,
+    FALLBACK_TRIGGER_STATUSES,
+    gather_callback_url,
+    status_callback_url,
+)
 
 router = APIRouter(prefix="/webhooks/twilio", tags=["webhooks"])
 
@@ -126,23 +138,37 @@ async def _form_params(request: Request) -> dict[str, str]:
 
 
 async def verified_twilio_params(request: Request) -> dict[str, str]:
-    """The callback's form params, once its signature proves Twilio sent them.
+    """The status callback's params, once its signature proves Twilio sent them."""
+    return await _verified_params(request, status_callback_url())
 
-    A dependency rather than a check inside the handler, so the refusal happens
-    before the handler runs and there is no path on which a forged callback
-    touches the database — the endpoint fails closed, it does not
-    process-then-reject.
+
+async def verified_gather_params(request: Request) -> dict[str, str]:
+    """The confirmation callback's params, verified against its own URL.
+
+    A separate dependency only because the signature covers the URL Twilio
+    posted to, and this endpoint's URL is not the status callback's. Everything
+    it refuses, and the reasons it refuses them, are the status callback's.
+    """
+    return await _verified_params(request, gather_callback_url())
+
+
+async def _verified_params(request: Request, url: str) -> dict[str, str]:
+    """One callback's form params, once its signature proves Twilio sent them.
+
+    Reached through a dependency rather than called inside a handler, so the
+    refusal happens before the handler runs and there is no path on which a
+    forged callback touches the database — the endpoints fail closed, they do
+    not process-then-reject.
 
     The signature covers the URL Twilio posted to, and the URL checked here is
-    ``PUBLIC_BASE_URL`` — the same one ``delivery_service`` hands Twilio as the
-    ``statusCallback``, so the two can never drift. It is also the only URL that
-    can be right in deployment: ngrok (and any proxy) terminates TLS and rewrites
-    the host, so ``request.url`` is the internal address, not the one Twilio
-    signed.
+    built from ``PUBLIC_BASE_URL`` — the same one ``delivery_service`` hands
+    Twilio as the ``statusCallback`` or the gather's ``action``, so the two can
+    never drift. It is also the only URL that can be right in deployment: ngrok
+    (and any proxy) terminates TLS and rewrites the host, so ``request.url`` is
+    the internal address, not the one Twilio signed.
     """
     params = await _form_params(request)
     signature = request.headers.get(SIGNATURE_HEADER, "")
-    url = status_callback_url()
 
     if not settings.TWILIO_AUTH_TOKEN:
         # Nothing to validate against means nothing can be trusted. Refusing is
@@ -200,6 +226,28 @@ async def twilio_status(
             channel=attempt.channel,
         )
         return TwilioStatusAck(result="ignored", reason=f"unmapped status {raw_status}")
+
+    if attempt.status == DeliveryStatus.CONFIRMED_RECEIVED.value and (
+        status is not DeliveryStatus.CONFIRMED_RECEIVED
+    ):
+        # The household pressed 1 mid-call, and the call's own ending is now
+        # arriving behind it — the ordinary sequence, not an edge case, since
+        # Twilio reports `completed` only once the call is over. Applying it
+        # would write `delivered` over a receipt and quietly undo the one fact
+        # in this system that came from a person (Domain Rule 6). Nothing else
+        # is applied either: a confirmed attempt is finished, so a terminal
+        # failure reported after it does not reroute a household that has
+        # already said it is safe.
+        log.info(
+            "twilio_status.after_confirmation",
+            twilio_sid=twilio_sid,
+            channel=attempt.channel,
+            attempt_number=attempt.attempt_number,
+            status=status.value,
+        )
+        return TwilioStatusAck(
+            result="ignored", status=status, reason="attempt already confirmed_received"
+        )
 
     if not await _record_callback(session, attempt, twilio_sid, status, raw_status):
         # Already applied. Returning before anything is written is what makes
@@ -281,6 +329,94 @@ def _identify_callback(
         return call_sid, call_status, CALL_STATUS_MAP
 
     return None
+
+
+@router.post("/voice-confirmation", response_class=Response)
+async def voice_confirmation(
+    params: dict[str, str] = Depends(verified_gather_params),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Record the digit a household pressed during its call.
+
+    Twilio posts here from the ``<Gather>`` wrapped around the call's script,
+    quoting the call's ``CallSid`` and the ``Digits`` pressed. A ``1`` is the
+    household saying it is safe, and it is the only input in this system that
+    writes ``confirmed_received`` (Domain Rule 6). Every other case — a
+    different digit, an empty gather, a SID that is not ours — leaves the
+    attempt exactly where the call's own status put it, because none of them is
+    a person answering.
+
+    The answer is always TwiML and always a 200: Twilio plays what it is given
+    back, and retries anything else. A confirmation is a status update on the
+    attempt that placed the call, never a new attempt (Domain Rule 2), and it is
+    not a failure, so nothing here reroutes.
+    """
+    twiml = Response(
+        content=delivery_service.confirmation_ack_twiml(), media_type="application/xml"
+    )
+
+    call_sid = params.get("CallSid")
+    if not call_sid:
+        logger.warning("twilio_confirmation.malformed_callback", fields=sorted(params))
+        return twiml
+
+    attempt = (
+        await session.exec(select(DeliveryAttempt).where(DeliveryAttempt.twilio_sid == call_sid))
+    ).first()
+    if attempt is None:
+        logger.warning("twilio_confirmation.unknown_sid", twilio_sid=call_sid)
+        return twiml
+
+    log = logger.bind(alert_id=str(attempt.alert_id), household_id=str(attempt.household_id))
+
+    digits = params.get("Digits", "")
+    if digits != CONFIRMATION_DIGIT:
+        # A mis-key, or a gather that ended with nothing in it. The call is
+        # still whatever its status callback says it is — `delivered` at most —
+        # and inferring a receipt from a household reaching for its keypad and
+        # missing is exactly what Domain Rule 6 forbids.
+        log.info(
+            "twilio_confirmation.not_a_confirmation",
+            twilio_sid=call_sid,
+            attempt_number=attempt.attempt_number,
+            digits=digits,
+        )
+        return twiml
+
+    if not await _record_callback(
+        session, attempt, call_sid, DeliveryStatus.CONFIRMED_RECEIVED, digits
+    ):
+        # Twilio retries this callback like any other, and a household can press
+        # 1 twice. Either way the confirmation is one event, guarded by the same
+        # `(twilio_sid, status)` record the status webhook uses — so no second
+        # write and no second event to the console.
+        log.info(
+            "twilio_confirmation.duplicate_callback",
+            twilio_sid=call_sid,
+            attempt_number=attempt.attempt_number,
+        )
+        return twiml
+
+    attempt.status = DeliveryStatus.CONFIRMED_RECEIVED.value
+    # Terminal: a household that has answered is not waiting on anything
+    # further, whatever the call does next.
+    attempt.completed_at = datetime.now(UTC)
+    session.add(attempt)
+    await session.commit()
+
+    log.info(
+        "twilio_confirmation.applied",
+        twilio_sid=call_sid,
+        channel=attempt.channel,
+        attempt_number=attempt.attempt_number,
+        status=attempt.status,
+    )
+    # After the commit, as with every other broadcast: a console is never shown
+    # a household as safe before the database has accepted it. This event is how
+    # a dispatcher watching the grid sees the household drop off the list of
+    # people who still need someone to go and knock.
+    await dispatcher_ws.broadcast_delivery_update(attempt)
+    return twiml
 
 
 async def _record_callback(

@@ -36,6 +36,7 @@ TWILIO_PHONE_NUMBER = "+15550000000"
 # does. The real one only ever comes from the environment.
 TWILIO_AUTH_TOKEN = "test-auth-token"
 STATUS_CALLBACK_URL = f"{PUBLIC_BASE_URL}{delivery_service.STATUS_CALLBACK_PATH}"
+GATHER_CALLBACK_URL = f"{PUBLIC_BASE_URL}{delivery_service.GATHER_CALLBACK_PATH}"
 
 
 def twilio_signed_headers(
