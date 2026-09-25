@@ -148,7 +148,7 @@ This keeps Claude's role narrow, testable, and auditable — good for a disaster
 |---|---|---|
 | Voice | Programmable Voice + TwiML | Plays `voice_script` via TTS (or pre-recorded/native-speaker audio if available), gathers DTMF confirmation |
 | SMS | Programmable Messaging | Sends `sms_text`; use Twilio delivery status webhooks |
-| ASL / Video | WhatsApp Business API or MMS with hosted video link | Sends link to short ASL avatar/interpreter clip generated from `asl_video_caption` |
+| ASL / Video | WhatsApp Business API or MMS with hosted video link | Sends a pre-recorded interpreter clip chosen by severity + action tag, with `asl_video_caption` as the message body (see "Decision: ASL delivery") |
 | Native language | Same Voice/SMS paths, just content is localized | Language is a content property, not a separate channel |
 
 **Status webhooks are essential**: Twilio calls back to `/webhooks/twilio/status` on delivery/call state changes. This webhook updates `DeliveryAttempt.status` and pushes the update to the WebSocket layer immediately — this is what makes the dispatcher console "live."
@@ -395,9 +395,104 @@ CONSOLE_ORIGINS=   # comma-separated console origins allowed to read the API fro
 
 ## Open Design Decisions to Make Early
 
-- **ASL delivery**: pre-recorded human interpreter clips per template message vs. AI avatar generation — affects scope a lot. Starting with a small library of pre-recorded common-phrase clips + Claude only writing captions is far more buildable than generating video. *(Still open — #18.)*
+- **ASL delivery**: pre-recorded human interpreter clips per template message vs. AI avatar generation — affects scope a lot. Starting with a small library of pre-recorded common-phrase clips + Claude only writing captions is far more buildable than generating video. *(**Decided** — see "Decision: ASL delivery" below.)*
 - **Confirmation of safety**: do you want two-way interaction (press 1 to confirm safe) in v1, or just delivery confirmation? Two-way is a strong differentiator but adds IVR complexity. *(**Decided** — see "Decision: IVR confirmation" below.)*
 - **Zone lookup**: simple zone_id field vs. real geofencing — geofencing is a nice-to-have, not needed for the core loop.
+
+---
+
+## Decision: ASL delivery
+
+**v1 uses a small library of pre-recorded human-interpreter clips, not generated avatar video.**
+CLAUDE.md's stated default stands, and **#19 is scoped against the clip library**. Decided under
+#18 (time-boxed spike, no production code); this note is the whole deliverable.
+
+**Why, given that generated video is the more general mechanism:**
+
+- **A clip can be reviewed before the disaster; a generated one cannot be reviewed at all.**
+  Nobody in this system's loop reads ASL. The dispatcher writing the alert does not, and neither
+  does the console. A pre-recorded clip is signed by a certified interpreter and checked once,
+  calmly, months before it is used; an avatar's output would go out to a deaf household with no
+  human having understood what it said. Domain Rule 1 — Claude rewrites form, never content — is
+  enforceable on text because the generated text can be diffed against the facts it was given.
+  On signed video it would be unenforceable in practice, which makes "the avatar signed the
+  evacuation route wrong" a failure mode with no detection path in front of it. That is the
+  deciding argument, ahead of the scope one.
+- **Facial grammar is not decoration.** In ASL, eyebrow position, head tilt and mouth morphemes
+  carry grammatical meaning — they are what distinguish a question from a statement and mark the
+  conditional. Avatar output is still weakest at exactly that layer, and the register it is
+  weakest on is urgency. This channel exists to tell someone to leave their house right now.
+- **It keeps generation out of the delivery path.** A zone dispatch is hundreds of concurrent
+  sends behind a semaphore; rendering video per household would put a second, far slower external
+  service inside that fan-out, plus generated-media hosting and its own retry and failure
+  semantics. The clip library is a static lookup: no call, no render wait, no new failure mode in
+  a path whose whole job is to be fast and to never strand a household.
+- **The clip library is one table and one send branch.** No new external service, no new
+  dependency, no model change and therefore **no migration**. Everything downstream — the status
+  webhook, `(twilio_sid, status)` idempotency, the console, fallback rerouting — is already built
+  and channel-agnostic, so #19 is a `_send_video` beside `_send_sms` and `_send_voice`, not a
+  second delivery path.
+
+**How a clip is selected** (implementation-ready detail for #19):
+
+- The library is a versioned constant — a manifest in code, in the spirit of
+  `services/prompts/` — mapping a key to a clip. Suggested home:
+  `backend/app/services/asl_clips.py`. The video files themselves are **not** committed to the
+  repo; the manifest holds filenames and a new `ASL_CLIP_BASE_URL` setting in `app/config.py`
+  (with a matching `.env.example` entry) says where they are served from, because Twilio must be
+  able to fetch the media over the public internet.
+- The key is **`(severity, action_tag)`**, where `action_tag` names what the household is being
+  told to *do*: `evacuate`, `shelter_in_place`, `boil_water`, `avoid_area`. Small on purpose —
+  four actions across three severities, plus one default clip per severity, is roughly a dozen
+  clips, which is a morning of an interpreter's time.
+- `action_tag` is derived from **`alert.raw_message` (plus `alert.title`)** — the dispatcher's own
+  English source text — by an ordered keyword table, first match wins, most urgent action first.
+  It is deliberately **not** derived from the generated `asl_video_caption`, for two reasons.
+  The caption is written in the *household's* language, so two deaf households on the same alert
+  with different `language` values would keyword-match differently and be sent different clips
+  for the same emergency. And a generated string is not a stable routing key: generation controls
+  form, and letting it also choose which video goes out would hand Claude a decision Domain Rule 1
+  keeps on the dispatcher's side of the line. The caption is still what the household *reads* —
+  it is just not what the lookup runs on.
+- **No match is not a failure.** An unmatched alert falls back to that severity's default clip
+  ("this is an emergency warning for your area, follow official instructions"), which is a correct
+  if unspecific warning — the same trade the text templates already make. Selection is a pure,
+  deterministic function with no I/O that never raises and always returns a clip, and the selected
+  clip id is logged (`delivery.asl_clip_selected`) with `alert_id` and `household_id`.
+- **The clip carries the action; the caption carries the facts.** A pre-recorded clip cannot know
+  this alert's shelter address, route or time, and producing one that claimed to would be
+  inventing content. So the send is always clip **and** `video_caption_text` together — never the
+  clip alone — and `content_generator`'s existing instruction to write the caption as one
+  instruction per line, standing alone for a deaf household, is what makes the text half
+  sufficient.
+- **Transport:** channel `video` (or `whatsapp`) sends via WhatsApp when `TWILIO_WHATSAPP_NUMBER`
+  is configured, falling back to MMS from `TWILIO_PHONE_NUMBER` otherwise — one `messages.create_async`
+  with `media_url=[clip_url]` and the caption as the body, so it reuses the SMS path's
+  `statusCallback`, refused-send handling and reroute trigger unchanged.
+
+**What this decision does not cover:**
+
+- **ASL only.** The library is American Sign Language. A deaf household whose signed language is
+  LSM, BSL or another is not served by these clips and is not in v1; that is a library problem,
+  not a mechanism problem, and the `(severity, action_tag)` key extends with a language dimension
+  when it arrives.
+- **The facts reach an ASL household as text.** This is the honest cost of the clip library: the
+  signed half is generic and the specifics — the address, the route, the time — are readable only
+  in the caption. Any alternative means per-alert signed video of alert-specific facts, i.e. the
+  avatar generation this decision rejects, or a live interpreter. Accepted for v1, with the
+  caption written at the household's literacy level as the mitigation.
+- **Which clip went out is logged, not stored.** Recording it on `DeliveryAttempt` would be a
+  column and a migration; if incident review needs the audit trail to name the clip rather than
+  the log to, that is a follow-up story.
+- **Producing the clips is not #19's work.** #19 builds the selection and the send against the
+  manifest; sourcing the actual interpreter recordings is a content task that runs alongside it,
+  and a placeholder-URL manifest is enough to build and test on (Twilio is mocked in tests
+  regardless).
+
+**Reversing it** costs the manifest, the config variable and `_send_video`'s body. Nothing else
+depends on the choice: the caption field, the channel enum, the webhook, the fallback chain and
+the console are identical either way, which is why this decision could be made this cheaply and
+could be remade later if the avatar case ever gets strong enough.
 
 ---
 
