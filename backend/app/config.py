@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     TWILIO_PHONE_NUMBER: str = ""
     TWILIO_WHATSAPP_NUMBER: str = ""
 
+    # Where the ASL interpreter clips are served from. The clips are not in the
+    # repo — `services/asl_clips.py` holds the manifest, this says where the
+    # files it names live — and the URL must be reachable from the public
+    # internet, because Twilio fetches the media itself rather than being handed
+    # it (docs/architecture.md, "Decision: ASL delivery").
+    ASL_CLIP_BASE_URL: str = ""
+
     # Infrastructure
     DATABASE_URL: str = "postgresql+asyncpg://localhost/disaster_response"
     PUBLIC_BASE_URL: str = ""

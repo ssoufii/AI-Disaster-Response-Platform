@@ -34,16 +34,23 @@ Three things shape this module:
    is made.
 7. **A channel changes how a send is made, not what happens around it.** SMS
    hands Twilio a body; voice hands it TwiML that reads the household's
-   ``voice_script`` aloud. Both write their row first, both carry the same
-   ``statusCallback``, and both report back through the same webhook — so the
-   status handling, idempotency and rerouting built for SMS carry over to voice
-   without a second code path.
+   ``voice_script`` aloud; ASL/video hands it a pre-recorded interpreter clip
+   with the household's ``video_caption_text`` as the body. All three write
+   their row first, all three carry the same ``statusCallback``, and all three
+   report back through the same webhook — so the status handling, idempotency
+   and rerouting built for SMS carry over to the rest without a second code
+   path.
 8. **A call listens for the keypress its own script asks for.** Every voice
    script ends by asking the household to press 1, so the ``<Say>`` is wrapped
    in a ``<Gather>`` whose result posts to the confirmation webhook. That
    keypress is the only thing in the system that can write
    ``confirmed_received`` (Domain Rule 6); nothing here infers it from a call
    being answered or heard out.
+9. **A signed clip goes out with its caption, never alone.** A pre-recorded
+   interpreter clip carries the action — evacuate, shelter, boil water — and
+   cannot carry this alert's shelter address or route; one that claimed to would
+   be inventing content (Domain Rule 1). So the ASL send is always the clip
+   *and* ``video_caption_text``, which is where the facts are.
 """
 
 import uuid
@@ -66,7 +73,7 @@ from app.models.alert_content import AlertContent
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import Channel, DeliveryStatus, HouseholdStatus
 from app.models.household import Household
-from app.services import content_generator, dispatcher_ws
+from app.services import asl_clips, content_generator, dispatcher_ws
 
 logger = structlog.get_logger(__name__)
 
@@ -90,9 +97,20 @@ FIRST_ATTEMPT = 1
 # it is giving up on (CLAUDE.md, Twilio Integration).
 FALLBACK_TRIGGER_STATUSES = frozenset({DeliveryStatus.FAILED, DeliveryStatus.NO_ANSWER})
 
-# Channels this build can actually send on. ASL/video (#19) is still ahead in
-# CLAUDE.md's Build Order.
-SENDABLE_CHANNELS = frozenset({Channel.SMS, Channel.VOICE})
+# Channels this build can actually send on — all of them, as of #19.
+SENDABLE_CHANNELS = frozenset({Channel.SMS, Channel.VOICE, Channel.VIDEO, Channel.WHATSAPP})
+
+# The two channels an ASL clip goes out on. They are one send with two
+# transports, not two channels: ``video`` is a household asking for signed
+# video and ``whatsapp`` a household asking for it on WhatsApp specifically,
+# and which of the two Twilio products carries it is decided by configuration
+# below rather than by the household's own word for it.
+CLIP_CHANNELS = frozenset({Channel.VIDEO, Channel.WHATSAPP})
+
+# WhatsApp addresses carry a scheme on both ends of the send; MMS numbers do
+# not. Normalising rather than assuming, because the configured number may
+# already be written either way.
+WHATSAPP_SCHEME = "whatsapp:"
 
 # A call reports only `completed` unless the events are asked for by name, and
 # the console is meant to show a call ringing, not jump from queued to its
@@ -161,11 +179,11 @@ async def deliver_alert(
     re-dispatching never sends a household the same warning twice — the same
     guarantee content generation already makes about its rows.
 
-    SMS and voice are wired up; ASL/video (#19) is still ahead in CLAUDE.md's
-    Build Order. A household on that channel is logged and left without an
-    attempt rather than sent something it cannot receive. That is a build-order
-    gap, not Domain Rule 4's ``unreached``, which means an exhausted fallback
-    chain and is issue #13's to set.
+    Every channel a household can ask for is wired up: SMS, voice, and ASL/video
+    over WhatsApp or MMS. A channel outside the enum would still be logged and
+    left without an attempt rather than sent something it cannot receive, which
+    is a configuration gap rather than Domain Rule 4's ``unreached`` — that one
+    means an exhausted fallback chain, and is set in ``_mark_unreached``.
     """
     log = logger.bind(alert_id=str(alert.id))
 
@@ -270,10 +288,10 @@ async def _send(
 ) -> None:
     """Send a recorded attempt on its own channel.
 
-    SMS and voice are wired up; a row on a channel that is not (a fallback onto
-    video, say) stays ``queued`` and is logged. It is deliberately not marked
-    failed: nothing was tried, so calling it a failure would walk the household
-    down its fallback chain for a channel this build simply has not built yet.
+    Every channel in the enum is sendable. A row on one that somehow is not
+    stays ``queued`` and is logged; it is deliberately not marked failed,
+    because nothing was tried, and calling it a failure would walk the household
+    one step further down its fallback chain for a channel nobody attempted.
     """
     channel = Channel(attempt.channel)
     if channel is Channel.SMS:
@@ -281,6 +299,9 @@ async def _send(
         return
     if channel is Channel.VOICE:
         await _send_voice(session, alert, household, attempt, content)
+        return
+    if channel in CLIP_CHANNELS:
+        await _send_video(session, alert, household, attempt, content)
         return
 
     logger.bind(alert_id=str(alert.id), household_id=str(household.id)).warning(
@@ -347,6 +368,84 @@ async def _send_voice(
 
     await _record_accepted_send(session, alert, household, attempt, call.sid)
     return attempt
+
+
+async def _send_video(
+    session: AsyncSession,
+    alert: Alert,
+    household: Household,
+    attempt: DeliveryAttempt,
+    content: AlertContent,
+) -> DeliveryAttempt:
+    """Send one recorded attempt as a signed clip plus its caption. Never raises.
+
+    The only channel that serves a deaf household in its own language, and the
+    one whose content does not come from Claude: the clip is picked from a
+    reviewed library by ``(severity, action_tag)`` derived from the dispatcher's
+    own English (docs/architecture.md, "Decision: ASL delivery"), while the
+    caption beside it is generated and carries this alert's facts.
+
+    Selection never fails — an unmatched alert gets its severity's default clip
+    — so the only thing that can stop this send is Twilio refusing it, or this
+    deployment having no clips configured, which ``clip_url`` raises about and
+    the same ``except`` records as a failed attempt. Which clip went out is
+    logged rather than stored: putting it on ``DeliveryAttempt`` would be a
+    column and a migration for something the log already answers.
+
+    Mechanically it is the SMS path with media attached, which is the point —
+    the ``statusCallback``, the refused-send handling and the reroute trigger
+    are unchanged, so a clip Twilio cannot deliver walks the household down its
+    fallback chain exactly as a failed SMS does.
+    """
+    log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
+    clip = asl_clips.select_clip(alert)
+    log.info(
+        "delivery.asl_clip_selected",
+        channel=attempt.channel,
+        attempt_number=attempt.attempt_number,
+        clip_id=clip.id,
+        severity=alert.severity,
+        action_tag=clip.action_tag,
+    )
+
+    to, from_ = _clip_addresses(household)
+    try:
+        message = await get_client().messages.create_async(
+            to=to,
+            from_=from_,
+            body=content.video_caption_text,
+            media_url=[asl_clips.clip_url(clip)],
+            status_callback=status_callback_url(),
+        )
+    except Exception as exc:
+        await _record_refused_send(session, alert, household, attempt, exc)
+        return attempt
+
+    await _record_accepted_send(session, alert, household, attempt, message.sid)
+    return attempt
+
+
+def _clip_addresses(household: Household) -> tuple[str, str]:
+    """``(to, from_)`` for a clip send: WhatsApp if configured, else MMS.
+
+    WhatsApp is preferred because it carries video the deaf community already
+    uses it for, and it is only available when an account has a WhatsApp sender
+    — so MMS from the ordinary number is the fallback, not a lesser second
+    choice made for its own sake. Both are ``messages.create_async`` with
+    ``media_url``; the addresses are the whole difference.
+    """
+    whatsapp_number = settings.TWILIO_WHATSAPP_NUMBER.strip()
+    if not whatsapp_number:
+        return household.phone_number, settings.TWILIO_PHONE_NUMBER
+    return (
+        _whatsapp_address(household.phone_number),
+        _whatsapp_address(whatsapp_number),
+    )
+
+
+def _whatsapp_address(number: str) -> str:
+    """A number as WhatsApp addresses it, whichever way it was written down."""
+    return f"{WHATSAPP_SCHEME}{number.removeprefix(WHATSAPP_SCHEME)}"
 
 
 def _voice_twiml(alert: Alert, household: Household, content: AlertContent) -> str:
