@@ -32,6 +32,10 @@ from app.webhooks.twilio_status import SIGNATURE_HEADER
 
 PUBLIC_BASE_URL = "https://disaster-response.test"
 TWILIO_PHONE_NUMBER = "+15550000000"
+TWILIO_WHATSAPP_NUMBER = "+15550000001"
+# Where the ASL interpreter clips would be served from. Twilio is fake here, so
+# nothing is ever fetched — the tests assert on the URL handed to it.
+ASL_CLIP_BASE_URL = "https://clips.disaster-response.test/asl"
 # Not a credential: a stand-in token so tests can sign callbacks the way Twilio
 # does. The real one only ever comes from the environment.
 TWILIO_AUTH_TOKEN = "test-auth-token"
@@ -125,7 +129,9 @@ def twilio(monkeypatch: pytest.MonkeyPatch) -> FakeTwilio:
     # rather than the empty-string defaults a developer machine carries.
     monkeypatch.setattr(settings, "PUBLIC_BASE_URL", PUBLIC_BASE_URL)
     monkeypatch.setattr(settings, "TWILIO_PHONE_NUMBER", TWILIO_PHONE_NUMBER)
+    monkeypatch.setattr(settings, "TWILIO_WHATSAPP_NUMBER", TWILIO_WHATSAPP_NUMBER)
     monkeypatch.setattr(settings, "TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN)
+    monkeypatch.setattr(settings, "ASL_CLIP_BASE_URL", ASL_CLIP_BASE_URL)
     return fake
 
 

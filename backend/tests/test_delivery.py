@@ -20,18 +20,22 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.config import settings
+from app.models.alert import Alert
 from app.models.alert_content import AlertContent
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.delivery_status_callback import DeliveryStatusCallback
+from app.models.enums import Severity
 from app.models.household import Household
-from app.services import content_generator, delivery_service
+from app.services import asl_clips, content_generator, delivery_service
 from app.webhooks import twilio_status
 from scripts.seed import TWILIO_UNDELIVERABLE_SMS_NUMBER, seed_demo_data
 from tests.conftest import (
+    ASL_CLIP_BASE_URL,
     GATHER_CALLBACK_URL,
     PUBLIC_BASE_URL,
     TWILIO_AUTH_TOKEN,
     TWILIO_PHONE_NUMBER,
+    TWILIO_WHATSAPP_NUMBER,
     FakeTwilio,
     twilio_signed_headers,
 )
@@ -78,19 +82,15 @@ async def _zone(client: AsyncClient, name: str = "Riverside District") -> str:
     return (await client.post("/zones", json={"name": name})).json()["id"]
 
 
-async def _alert(client: AsyncClient, zone_id: str) -> str:
-    return (
-        await client.post(
-            "/alerts",
-            json={
-                "title": "Flash flood evacuation",
-                "raw_message": "Evacuate the riverside area immediately.",
-                "severity": "evacuate_now",
-                "facts": {"shelter": "Lincoln High School, 400 Oak St"},
-                "zone_id": zone_id,
-            },
-        )
-    ).json()["id"]
+async def _alert(client: AsyncClient, zone_id: str, **overrides: object) -> str:
+    payload: dict[str, object] = {
+        "title": "Flash flood evacuation",
+        "raw_message": "Evacuate the riverside area immediately.",
+        "severity": "evacuate_now",
+        "facts": {"shelter": "Lincoln High School, 400 Oak St"},
+        "zone_id": zone_id,
+    }
+    return (await client.post("/alerts", json=payload | overrides)).json()["id"]
 
 
 async def _household(
@@ -108,11 +108,19 @@ async def _household(
 
 
 async def _dispatch_one_sms_household(
-    client: AsyncClient, phone_number: str = "+15550100001", **overrides: object
+    client: AsyncClient,
+    phone_number: str = "+15550100001",
+    alert: dict[str, object] | None = None,
+    **overrides: object,
 ) -> tuple[str, str]:
-    """Draft, dispatch, and return ``(alert_id, household_id)``."""
+    """Draft, dispatch, and return ``(alert_id, household_id)``.
+
+    ``alert`` overrides the drafted alert itself, for the tests where what the
+    dispatcher wrote is the thing under test — ASL clip selection reads the
+    title and raw_message.
+    """
     zone_id = await _zone(client)
-    alert_id = await _alert(client, zone_id)
+    alert_id = await _alert(client, zone_id, **(alert or {}))
     household_id = await _household(client, zone_id, phone_number, **overrides)
     await client.post(f"/alerts/{alert_id}/dispatch")
     return alert_id, household_id
@@ -227,18 +235,6 @@ async def test_dispatching_twice_does_not_send_a_household_a_second_message(
     assert len(await _attempts(session, alert_id)) == 1
 
 
-async def test_a_channel_that_is_not_yet_built_is_not_attempted(
-    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
-) -> None:
-    # ASL/video (#19) is still ahead in the build order; a household on it gets
-    # no attempt rather than an SMS it did not ask for.
-    alert_id, _ = await _dispatch_one_sms_household(client, preferred_channel="video")
-
-    assert twilio.messages.sent == []
-    assert twilio.calls.placed == []
-    assert await _attempts(session, alert_id) == []
-
-
 async def test_a_refused_send_still_leaves_a_failed_attempt_row(
     client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
 ) -> None:
@@ -280,6 +276,314 @@ async def test_one_households_failure_does_not_strand_the_rest_of_the_zone(
     assert body["deliveries_started"] == 2
     statuses = sorted(attempt.status for attempt in await _attempts(session, alert_id))
     assert statuses == ["failed", "queued"]
+
+
+# --- Dispatch: the ASL / video channel ---------------------------------------
+#
+# The last channel, and the only one whose content does not come from Claude:
+# the signed half is a pre-recorded interpreter clip picked from a reviewed
+# library by (severity, action_tag), and the caption beside it carries this
+# alert's facts (docs/architecture.md, "Decision: ASL delivery"). Everything
+# around the send — the row, the statusCallback, the webhook, the reroute — is
+# the machinery SMS and voice already proved.
+
+
+async def _dispatch_one_asl_household(
+    client: AsyncClient, phone_number: str = "+15550100901", **overrides: object
+) -> tuple[str, str]:
+    """Draft, dispatch to an ASL/video household, and return the two ids."""
+    return await _dispatch_one_sms_household(
+        client, phone_number=phone_number, preferred_channel="video", **overrides
+    )
+
+
+async def test_dispatch_sends_an_asl_household_a_clip_and_records_the_first_attempt(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, household_id = await _dispatch_one_asl_household(client)
+
+    assert twilio.calls.placed == []
+    attempts = await _attempts(session, alert_id)
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt.household_id == uuid.UUID(household_id)
+    assert attempt.channel == "video"
+    assert attempt.attempt_number == 1
+    # Queued, not delivered: Twilio has the clip, the household does not yet
+    # have the warning.
+    assert attempt.status == "queued"
+    assert attempt.twilio_sid == twilio.messages.sent[0].sid
+    assert attempt.error_reason is None
+
+
+async def test_the_clip_is_sent_with_the_caption_that_carries_the_facts(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 1: a pre-recorded clip cannot know this alert's shelter
+    # address, so the clip never goes out alone — the generated caption is the
+    # body of the same message.
+    await _dispatch_one_asl_household(client)
+
+    params = twilio.messages.sent[0].params
+    assert params["body"] == SMS_TEXT
+    assert params["media_url"] == [
+        f"{ASL_CLIP_BASE_URL}/asl-evacuate_now-evacuate.mp4",
+    ]
+    assert params["status_callback"] == f"{PUBLIC_BASE_URL}/webhooks/twilio/status"
+
+
+async def test_the_clip_goes_out_over_whatsapp_when_a_sender_is_configured(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    await _dispatch_one_asl_household(client, phone_number="+15550100902")
+
+    params = twilio.messages.sent[0].params
+    assert params["to"] == "whatsapp:+15550100902"
+    assert params["from_"] == f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+
+
+async def test_a_whatsapp_number_already_written_with_its_scheme_is_not_doubled(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "TWILIO_WHATSAPP_NUMBER", f"whatsapp:{TWILIO_WHATSAPP_NUMBER}")
+
+    await _dispatch_one_asl_household(client)
+
+    assert twilio.messages.sent[0].params["from_"] == f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
+
+
+async def test_without_a_whatsapp_sender_the_clip_goes_out_as_mms(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # MMS from the ordinary number is the fallback transport, not a lesser
+    # channel: the same clip and the same caption, addressed differently.
+    monkeypatch.setattr(settings, "TWILIO_WHATSAPP_NUMBER", "")
+
+    await _dispatch_one_asl_household(client, phone_number="+15550100903")
+
+    params = twilio.messages.sent[0].params
+    assert params["to"] == "+15550100903"
+    assert params["from_"] == TWILIO_PHONE_NUMBER
+    assert params["media_url"] == [f"{ASL_CLIP_BASE_URL}/asl-evacuate_now-evacuate.mp4"]
+
+
+async def test_a_household_on_the_whatsapp_channel_is_sent_the_same_clip(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # `video` and `whatsapp` are one send with two names: which Twilio product
+    # carries it is configuration's call, not the household's wording.
+    alert_id, _ = await _dispatch_one_sms_household(client, preferred_channel="whatsapp")
+
+    attempt = (await _attempts(session, alert_id))[0]
+    assert attempt.channel == "whatsapp"
+    assert attempt.twilio_sid == twilio.messages.sent[0].sid
+    assert twilio.messages.sent[0].params["media_url"] == [
+        f"{ASL_CLIP_BASE_URL}/asl-evacuate_now-evacuate.mp4",
+    ]
+
+
+async def test_the_clip_is_chosen_from_the_dispatchers_words_not_the_caption(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    # The caption the mocked Claude returns is about evacuating; the dispatcher
+    # wrote a boil-water notice. The clip follows the dispatcher, because the
+    # caption is written in the household's language and is not a stable
+    # routing key (docs/architecture.md, "Decision: ASL delivery").
+    await _dispatch_one_asl_household(
+        client,
+        alert={
+            "title": "Water main break",
+            "raw_message": "Boil water before drinking it until further notice.",
+            "severity": "warning",
+        },
+    )
+
+    assert twilio.messages.sent[0].params["media_url"] == [
+        f"{ASL_CLIP_BASE_URL}/asl-warning-boil_water.mp4",
+    ]
+
+
+async def test_an_alert_matching_no_action_still_gets_its_severitys_clip(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    # No match is not a failure: a generic but correct warning is signed, and
+    # the specifics travel in the caption as they always do.
+    await _dispatch_one_asl_household(
+        client,
+        alert={
+            "title": "Situation update",
+            "raw_message": "Conditions in the district have changed since this morning.",
+            "severity": "advisory",
+        },
+    )
+
+    assert twilio.messages.sent[0].params["media_url"] == [
+        f"{ASL_CLIP_BASE_URL}/asl-advisory-general.mp4",
+    ]
+
+
+async def test_the_most_urgent_action_wins_when_an_alert_names_two(
+    client: AsyncClient, twilio: FakeTwilio
+) -> None:
+    await _dispatch_one_asl_household(
+        client,
+        alert={
+            "title": "Wildfire",
+            "raw_message": "Avoid the area. Residents on Oak St must evacuate immediately.",
+            "severity": "evacuate_now",
+        },
+    )
+
+    assert twilio.messages.sent[0].params["media_url"] == [
+        f"{ASL_CLIP_BASE_URL}/asl-evacuate_now-evacuate.mp4",
+    ]
+
+
+def test_clip_selection_never_raises_on_a_severity_outside_the_enum() -> None:
+    # Selection is the one step that must always produce something: a deaf
+    # household has no channel to fall back to that it can read as easily.
+    alert = Alert(
+        title="Unknown",
+        raw_message="Something has happened.",
+        severity="catastrophic",
+        zone_id=uuid.uuid4(),
+    )
+
+    clip = asl_clips.select_clip(alert)
+
+    assert clip.id == "warning-general"
+    assert clip.action_tag == asl_clips.ACTION_GENERAL
+
+
+def test_every_severity_has_a_clip_for_every_action_and_a_default() -> None:
+    severities = {s.value for s in Severity}
+    actions = {action_tag for action_tag, _ in asl_clips.ACTION_KEYWORDS} | {
+        asl_clips.ACTION_GENERAL
+    }
+
+    assert set(asl_clips.CLIPS) == {(s, a) for s in severities for a in actions}
+    # A clip filed under one action and shot for another is the one mistake a
+    # manifest of this shape could make quietly.
+    assert all(clip.action_tag == action for (_, action), clip in asl_clips.CLIPS.items())
+
+
+async def test_the_clip_that_went_out_is_logged_against_its_alert_and_household(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Which clip was signed is logged rather than stored on the row: an audit
+    # trail that named it would be a column and a migration.
+    recorder = RecordingLogger()
+    monkeypatch.setattr(delivery_service, "logger", recorder)
+
+    _, household_id = await _dispatch_one_asl_household(client)
+
+    selected = [call for call in recorder.calls if call[1] == "delivery.asl_clip_selected"]
+    assert len(selected) == 1
+    level, _, context = selected[0]
+    assert level == "info"
+    assert context["clip_id"] == "evacuate_now-evacuate"
+    assert context["action_tag"] == "evacuate"
+    assert context["household_id"] == household_id
+    assert context["alert_id"]
+
+
+async def test_a_refused_clip_send_still_leaves_a_failed_attempt_row(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    twilio.messages.error = RuntimeError("number is not on WhatsApp")
+
+    alert_id, _ = await _dispatch_one_asl_household(client)
+
+    attempts = await _attempts(session, alert_id)
+    assert len(attempts) == 1
+    assert attempts[0].channel == "video"
+    assert attempts[0].status == "failed"
+    assert attempts[0].twilio_sid is None
+    assert "number is not on WhatsApp" in attempts[0].error_reason
+
+
+async def test_a_deployment_with_no_clip_library_fails_the_attempt_rather_than_sending(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Twilio fetches the media itself, so an unset base URL means there is
+    # nothing for it to fetch. Failing the row says so on the attempt — and
+    # reroutes the household onto a channel that can still reach it — where
+    # sending a URL Twilio cannot resolve would read as a carrier problem.
+    monkeypatch.setattr(settings, "ASL_CLIP_BASE_URL", "")
+
+    alert_id, _ = await _dispatch_one_asl_household(client)
+
+    assert twilio.messages.sent == []
+    attempt = (await _attempts(session, alert_id))[0]
+    assert attempt.status == "failed"
+    assert "ASL_CLIP_BASE_URL" in attempt.error_reason
+
+
+async def test_a_delivered_clip_moves_through_the_same_status_pipeline(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    alert_id, _ = await _dispatch_one_asl_household(client)
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="delivered")
+
+    attempt = (await _attempts(session, alert_id))[0]
+    assert attempt.status == "delivered"
+    assert attempt.completed_at is not None
+
+
+async def test_a_failed_clip_reroutes_onto_the_next_channel_like_any_other(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The whole point of building this channel last: nothing below the send
+    # needed changing for it.
+    alert_id, household_id = await _dispatch_one_asl_household(
+        client, fallback_channel_order=["sms"]
+    )
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="failed")
+
+    attempts = await _attempts(session, alert_id)
+    assert [(a.channel, a.attempt_number) for a in attempts] == [("video", 1), ("sms", 2)]
+    assert attempts[0].status == "failed"
+    assert attempts[1].status == "queued"
+    assert attempts[1].twilio_sid == twilio.messages.sent[1].sid
+    # The fallback SMS is a message with no clip attached.
+    assert "media_url" not in twilio.messages.sent[1].params
+
+
+async def test_an_asl_household_that_runs_out_of_channels_is_still_unreached(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # Domain Rule 4 is channel-blind, and a deaf household reaching it is the
+    # case that most needs a person: no other channel serves them.
+    alert_id, household_id = await _dispatch_one_asl_household(client, fallback_channel_order=[])
+
+    await _post_status(client, MessageSid=twilio.messages.sent[0].sid, MessageStatus="failed")
+
+    household = await session.get(Household, uuid.UUID(household_id))
+    assert household.last_known_status == "unreached"
+    assert len(await _attempts(session, alert_id)) == 1
+
+
+async def test_the_seed_asl_household_is_sent_a_clip(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
+) -> None:
+    # The seed's ASL/video household exists to exercise exactly this path
+    # end-to-end (CLAUDE.md, Testing).
+    zone, households = await seed_demo_data(session)
+    asl_household = next(h for h in households if h.preferred_channel == "video")
+    alert_id = await _alert(client, str(zone.id))
+
+    await client.post(f"/alerts/{alert_id}/dispatch")
+
+    attempt = next(
+        a for a in await _attempts(session, alert_id) if a.household_id == asl_household.id
+    )
+    assert attempt.channel == "video"
+    assert attempt.status == "queued"
+    sent = next(m for m in twilio.messages.sent if m.sid == attempt.twilio_sid)
+    assert sent.params["media_url"] == [f"{ASL_CLIP_BASE_URL}/asl-evacuate_now-evacuate.mp4"]
+    assert sent.params["to"] == f"whatsapp:{asl_household.phone_number}"
 
 
 # --- Dispatch: the voice channel ---------------------------------------------
@@ -1363,8 +1667,6 @@ async def test_content_already_written_for_the_fallback_channel_is_reused(
 async def test_a_fallback_onto_sms_is_dispatched_immediately(
     client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
 ) -> None:
-    # Voice (#16) and ASL/video (#19) cannot be sent on yet, so a second SMS is
-    # the one fallback this build can carry all the way to Twilio.
     alert_id, _ = await _dispatch_one_sms_household(client, fallback_channel_order=["sms"])
 
     await _fail_first_attempt(client, twilio)
@@ -1376,22 +1678,23 @@ async def test_a_fallback_onto_sms_is_dispatched_immediately(
     assert fallback.twilio_sid == twilio.messages.sent[1].sid
 
 
-async def test_a_fallback_onto_a_channel_this_build_cannot_send_stays_queued(
+async def test_a_fallback_onto_video_is_dispatched_as_a_clip(
     client: AsyncClient, session: AsyncSession, twilio: FakeTwilio
 ) -> None:
-    # The row is created because the chain really did move onto video; nothing
-    # is sent, because video is #19. Marking it failed instead would walk the
-    # household down its chain for a channel that was never tried.
+    # Every channel in the chain can now be sent on, so a household whose SMS
+    # fails onto video gets the signed clip rather than a row that sits queued.
     alert_id, _ = await _dispatch_one_sms_household(client, fallback_channel_order=["video"])
 
     await _fail_first_attempt(client, twilio)
 
-    assert len(twilio.messages.sent) == 1
     assert twilio.calls.placed == []
     fallback = (await _attempts(session, alert_id))[1]
     assert fallback.channel == "video"
     assert fallback.status == "queued"
-    assert fallback.twilio_sid is None
+    assert fallback.twilio_sid == twilio.messages.sent[1].sid
+    assert twilio.messages.sent[1].params["media_url"] == [
+        f"{ASL_CLIP_BASE_URL}/asl-evacuate_now-evacuate.mp4",
+    ]
 
 
 async def test_each_failure_walks_one_step_further_down_the_chain(
