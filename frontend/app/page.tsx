@@ -5,6 +5,8 @@
  * until it is, this says where the console lives rather than 404ing at the root.
  */
 
+import Link from "next/link";
+
 export default function Home() {
   return (
     <main className="mx-auto max-w-2xl px-6 py-16">
@@ -12,6 +14,13 @@ export default function Home() {
       <h1 className="mt-1 text-2xl font-semibold">Pick an alert to watch</h1>
       <p className="mt-2 text-slate-600">
         Live delivery status for one alert is at <code>/alerts/&lt;alert id&gt;</code>.
+      </p>
+      <p className="mt-2 text-slate-600">
+        Watching one needs the dispatch desk&apos;s token —{" "}
+        <Link className="underline" href="/sign-in">
+          sign in
+        </Link>{" "}
+        before an incident, not during one.
       </p>
     </main>
   );

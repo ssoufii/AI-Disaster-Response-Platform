@@ -28,6 +28,7 @@ from collections import defaultdict
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.auth import authorize_console_socket
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import Channel, DeliveryStatus
 from app.models.household import Household
@@ -169,13 +170,24 @@ async def broadcast_household_unreached(
 
 
 @router.websocket("/ws/alerts/{alert_id}")
-async def alert_updates(websocket: WebSocket, alert_id: uuid.UUID) -> None:
+async def alert_updates(
+    websocket: WebSocket, alert_id: uuid.UUID, token: str | None = None
+) -> None:
     """Subscribe one console to one alert's delivery updates.
+
+    The token arrives as a query parameter because a browser's ``WebSocket``
+    constructor takes a URL and nothing else — there is no handshake header to
+    put it in (see ``app/auth.py``). It is checked before ``accept()``, so a
+    console that cannot authenticate never enters the registry and no
+    ``delivery_update`` is ever sent to it.
 
     The alert is not looked up here. The console has already fetched the
     snapshot for this id — a 404 there is where a wrong id is caught — and a
     subscription to an alert that does not exist simply never receives anything.
     """
+    if not await authorize_console_socket(websocket, token):
+        return
+
     await manager.connect(alert_id, websocket)
     log = logger.bind(alert_id=str(alert_id))
     log.info("dispatcher_ws.connected", subscribers=manager.subscriber_count(alert_id))

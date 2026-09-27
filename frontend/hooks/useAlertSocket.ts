@@ -12,11 +12,16 @@
  * without a DOM. What stays here is React's share of it: handlers held in a ref
  * so a new inline callback on each render does not tear the socket down, frame
  * parsing, and the connection state the page renders its banner from.
+ *
+ * Both halves of the connection carry the dispatcher token (#20): the handshake
+ * has it on the URL, because a browser `WebSocket` has no header to put it in,
+ * and the resync fetch sends it as a bearer header like any other read.
  */
 
 import { useEffect, useRef, useState } from "react";
 
 import { fetchAlertStatus } from "@/lib/api";
+import { alertSocketUrl } from "@/lib/auth";
 import { connectAlertSocket, type ConnectionState } from "@/lib/alertSocketController";
 import { WS_BASE_URL } from "@/lib/env";
 import {
@@ -28,6 +33,7 @@ import {
 
 export function useAlertSocket(
   alertId: string,
+  token: string,
   onEvent: (event: AlertSocketEvent) => void,
   onResync: (snapshot: AlertStatusSnapshot) => void,
 ): ConnectionState {
@@ -40,10 +46,10 @@ export function useAlertSocket(
 
   useEffect(() => {
     const connectionHandle = connectAlertSocket({
-      url: `${WS_BASE_URL}/ws/alerts/${alertId}`,
+      url: alertSocketUrl(WS_BASE_URL, alertId, token),
       // The socket is a diff channel; this endpoint is the source of truth the
       // diffs apply on top of, on load and again after every outage.
-      fetchSnapshot: () => fetchAlertStatus(alertId),
+      fetchSnapshot: () => fetchAlertStatus(alertId, token),
       onFrame: (data: string) => {
         let payload: unknown;
         try {
@@ -66,7 +72,9 @@ export function useAlertSocket(
     return () => {
       connectionHandle.close();
     };
-  }, [alertId]);
+    // A new token is a new connection: the old one was opened with a credential
+    // the backend may no longer accept.
+  }, [alertId, token]);
 
   return connection;
 }

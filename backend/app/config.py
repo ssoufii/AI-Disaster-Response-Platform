@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     # it (docs/architecture.md, "Decision: ASL delivery").
     ASL_CLIP_BASE_URL: str = ""
 
+    # The shared secret a dispatcher's console presents to read or dispatch an
+    # alert. One token for the whole dispatch desk rather than per-user accounts:
+    # #20's story puts user and role management out of scope, and a console
+    # nobody can sign into during an incident is worse than a shared credential
+    # held by the people already trusted to order an evacuation.
+    #
+    # Empty by default, and empty means *refuse everything* rather than let
+    # everything through — see ``app/auth.py``. A deployment that forgot the
+    # variable is a deployment whose console is closed, not one whose households'
+    # phone numbers are public.
+    DISPATCHER_API_TOKEN: str = ""
+
     # Infrastructure
     DATABASE_URL: str = "postgresql+asyncpg://localhost/disaster_response"
     PUBLIC_BASE_URL: str = ""

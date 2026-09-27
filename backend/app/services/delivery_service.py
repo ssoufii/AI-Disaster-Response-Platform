@@ -51,12 +51,21 @@ Three things shape this module:
    cannot carry this alert's shelter address or route; one that claimed to would
    be inventing content (Domain Rule 1). So the ASL send is always the clip
    *and* ``video_caption_text``, which is where the facts are.
+10. **A throttled send is waited out, not failed.** A 429 or a 5xx is Twilio
+   asking for a moment, not this channel refusing the warning, so the send is
+   retried with exponential backoff before anything is written as failed. The
+   distinction matters because failing would reroute the household onto its next
+   channel — the same throttled account — and spend its whole fallback chain on
+   a limit that would have cleared in seconds. Every other 4xx is the send
+   genuinely refused and is not retried.
 """
 
+import asyncio
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from functools import lru_cache
+from typing import TypeVar
 
 import structlog
 from sqlmodel import select
@@ -65,6 +74,7 @@ from twilio.http.async_http_client import AsyncTwilioHttpClient
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
+from app.backoff import backoff_seconds
 from app.config import settings
 from app.db import session_scope
 from app.logging_config import redact_phone
@@ -141,6 +151,82 @@ CONFIRMATION_DIGIT = "1"
 # waiting on has just been told to evacuate.
 CONFIRMATION_NUM_DIGITS = 1
 CONFIRMATION_TIMEOUT_SECONDS = 10
+
+# A rate limit is not this household's send failing — it is the account being
+# told to slow down, and the send would have been fine a second later. Walking a
+# household down its fallback chain over one would be worse than useless: the
+# next channel is the same throttled account, so the reroute trips the same limit
+# and burns the chain without ever reaching anyone.
+#
+# Four attempts spaced roughly 1s, 2s, 4s (jittered — see ``app/backoff.py``)
+# ride out about seven seconds of throttling, which is what a large zone's
+# fan-out provokes, without leaving a household waiting long enough to matter.
+# The same shape Claude generation uses, because it is the same problem.
+TWILIO_MAX_ATTEMPTS = 4
+TWILIO_INITIAL_BACKOFF_SECONDS = 1.0
+
+# 429 is Twilio's rate limit. A 5xx is Twilio itself having a bad moment, which
+# is the same kind of "ask again" — the request was accepted as well-formed and
+# simply was not served.
+#
+# Deliberately not retried: every other 4xx. An unroutable number, an
+# unverified sender, a number that cannot receive MMS — waiting does not fix
+# any of them, and retrying is three more seconds before this household starts
+# down the fallback chain that actually might reach it.
+TWILIO_RATE_LIMIT_STATUS = 429
+
+
+T = TypeVar("T")
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Whether Twilio is saying "not now" rather than "not this send".
+
+    Duck-typed on ``status`` rather than matched against ``TwilioRestException``:
+    that is the attribute every Twilio error carries an HTTP status in, and
+    nothing else in this path carries one. An exception with no status at all —
+    a DNS failure, a timeout — is not retried here. It is recorded as a failed
+    attempt, which starts the fallback onto a different channel, and that is a
+    better answer for the household than retrying a transport that is down.
+    """
+    status = getattr(exc, "status", None)
+    if not isinstance(status, int):
+        return False
+    return status == TWILIO_RATE_LIMIT_STATUS or 500 <= status < 600
+
+
+async def _with_backoff(
+    log: structlog.BoundLogger, send: Callable[[], Awaitable[T]], *, channel: str
+) -> T:
+    """Call Twilio, waiting out a rate limit rather than giving up on it.
+
+    Raises whatever the last attempt raised, so the caller's ``except`` still
+    records a refused send exactly as before — this only decides how many times
+    "refused" has to be said before it is believed.
+
+    Applied to every channel and every severity. There is no proactive pacing
+    delay to skip for ``evacuate_now`` (Domain Rule 5) because there is no
+    proactive pacing: nothing here slows down a send Twilio would have taken.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await send()
+        except Exception as exc:
+            if not _is_retryable(exc) or attempt >= TWILIO_MAX_ATTEMPTS:
+                raise
+            delay = backoff_seconds(attempt, TWILIO_INITIAL_BACKOFF_SECONDS)
+            log.warning(
+                "delivery.send_throttled",
+                channel=channel,
+                attempt=attempt,
+                attempts_allowed=TWILIO_MAX_ATTEMPTS,
+                backoff_seconds=round(delay, 3),
+                status=getattr(exc, "status", None),
+                error_type=type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
 
 
 @lru_cache
@@ -319,12 +405,17 @@ async def _send_sms(
     content: AlertContent,
 ) -> DeliveryAttempt:
     """Hand one recorded attempt to Twilio as a message. Never raises."""
+    log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
     try:
-        message = await get_client().messages.create_async(
-            to=household.phone_number,
-            from_=settings.TWILIO_PHONE_NUMBER,
-            body=content.generated_text,
-            status_callback=status_callback_url(),
+        message = await _with_backoff(
+            log,
+            lambda: get_client().messages.create_async(
+                to=household.phone_number,
+                from_=settings.TWILIO_PHONE_NUMBER,
+                body=content.generated_text,
+                status_callback=status_callback_url(),
+            ),
+            channel=attempt.channel,
         )
     except Exception as exc:
         await _record_refused_send(session, alert, household, attempt, exc)
@@ -353,14 +444,19 @@ async def _send_voice(
     the outcome and a console watching a dispatch would show a household sitting
     at ``queued`` for the length of the ring.
     """
+    log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
     try:
-        call = await get_client().calls.create_async(
-            to=household.phone_number,
-            from_=settings.TWILIO_PHONE_NUMBER,
-            twiml=_voice_twiml(alert, household, content),
-            status_callback=status_callback_url(),
-            status_callback_event=VOICE_STATUS_CALLBACK_EVENTS,
-            status_callback_method="POST",
+        call = await _with_backoff(
+            log,
+            lambda: get_client().calls.create_async(
+                to=household.phone_number,
+                from_=settings.TWILIO_PHONE_NUMBER,
+                twiml=_voice_twiml(alert, household, content),
+                status_callback=status_callback_url(),
+                status_callback_event=VOICE_STATUS_CALLBACK_EVENTS,
+                status_callback_method="POST",
+            ),
+            channel=attempt.channel,
         )
     except Exception as exc:
         await _record_refused_send(session, alert, household, attempt, exc)
@@ -410,12 +506,16 @@ async def _send_video(
 
     to, from_ = _clip_addresses(household)
     try:
-        message = await get_client().messages.create_async(
-            to=to,
-            from_=from_,
-            body=content.video_caption_text,
-            media_url=[asl_clips.clip_url(clip)],
-            status_callback=status_callback_url(),
+        message = await _with_backoff(
+            log,
+            lambda: get_client().messages.create_async(
+                to=to,
+                from_=from_,
+                body=content.video_caption_text,
+                media_url=[asl_clips.clip_url(clip)],
+                status_callback=status_callback_url(),
+            ),
+            channel=attempt.channel,
         )
     except Exception as exc:
         await _record_refused_send(session, alert, household, attempt, exc)
