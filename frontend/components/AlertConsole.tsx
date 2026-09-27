@@ -10,6 +10,10 @@
  *
  * It also owns the two halves of an outage: the banner while the socket is
  * down, and reseeding the reducer from the resynced snapshot once it is back.
+ *
+ * The token is handed down from the page rather than read here: the socket
+ * handshake and the resync fetch both present it, and the page has already read
+ * it from the request's cookie to fetch the snapshot at all (#20).
  */
 
 import { useCallback, useReducer } from "react";
@@ -20,7 +24,13 @@ import { useAlertSocket } from "@/hooks/useAlertSocket";
 import { consoleReducer, initialConsoleState } from "@/lib/consoleState";
 import type { AlertSocketEvent, AlertStatusSnapshot } from "@/lib/types";
 
-export function AlertConsole({ snapshot }: { snapshot: AlertStatusSnapshot }) {
+export function AlertConsole({
+  snapshot,
+  token,
+}: {
+  snapshot: AlertStatusSnapshot;
+  token: string;
+}) {
   const [state, dispatch] = useReducer(consoleReducer, snapshot, initialConsoleState);
 
   const onEvent = useCallback((event: AlertSocketEvent) => {
@@ -37,7 +47,7 @@ export function AlertConsole({ snapshot }: { snapshot: AlertStatusSnapshot }) {
     dispatch({ type: "snapshot_resync", snapshot: resynced });
   }, []);
 
-  const connection = useAlertSocket(snapshot.alert_id, onEvent, onResync);
+  const connection = useAlertSocket(snapshot.alert_id, token, onEvent, onResync);
 
   return (
     <>

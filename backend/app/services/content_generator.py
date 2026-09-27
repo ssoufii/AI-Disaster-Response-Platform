@@ -40,6 +40,7 @@ import structlog
 from anthropic import AsyncAnthropic
 from pydantic import ValidationError
 
+from app.backoff import backoff_seconds
 from app.config import settings
 from app.exceptions import ContentGenerationError
 from app.models.alert import Alert
@@ -59,9 +60,15 @@ MAX_TOKENS = 2048
 MAX_ATTEMPTS = 2
 
 # A rate limit is a different kind of failure: the request was fine, the API is
-# busy. Four attempts spaced 1s, 2s, 4s ride out roughly seven seconds of
+# busy. Four attempts spaced roughly 1s, 2s, 4s ride out roughly seven seconds of
 # throttling, which is what a large zone's fan-out tends to provoke, without
 # leaving a household waiting long enough to matter.
+#
+# "Roughly", because the delays are jittered (``app/backoff.py``). A zone fans
+# out ``CLAUDE_CONCURRENCY`` calls at once, so the households that trip the rate
+# limit trip it together — and an exact doubling would have all of them retry in
+# the same instant, recreating the burst that caused it. The jitter is what turns
+# a synchronised retry into a spread one.
 MAX_RATE_LIMIT_ATTEMPTS = 4
 INITIAL_BACKOFF_SECONDS = 1.0
 
@@ -129,7 +136,6 @@ async def generate(
     log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
     channel = channel or household.preferred_channel
     attempt = 0
-    backoff = INITIAL_BACKOFF_SECONDS
 
     while True:
         attempt += 1
@@ -155,8 +161,7 @@ async def generate(
             if attempt >= attempts_allowed:
                 break
             if rate_limited:
-                await asyncio.sleep(backoff)
-                backoff *= 2
+                await asyncio.sleep(backoff_seconds(attempt, INITIAL_BACKOFF_SECONDS))
 
     content = template_for(alert.severity, household.language)
     log.warning(

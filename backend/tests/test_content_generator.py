@@ -388,6 +388,21 @@ def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     return slept
 
 
+def _assert_backoff_window(slept: list[float], nominal: list[float]) -> None:
+    """Assert each wait doubled, allowing for the jitter that spreads them out.
+
+    The delays are jittered on purpose (``app/backoff.py``): a zone fans out
+    ``CLAUDE_CONCURRENCY`` calls at once, so an exact schedule would have every
+    rate-limited household retry in the same instant and recreate the burst. So
+    what is asserted is the window each wait must land in — at least half its
+    nominal size, never more than all of it — rather than an exact value that
+    would only be true of an unjittered retry.
+    """
+    assert len(slept) == len(nominal)
+    for waited, expected in zip(slept, nominal, strict=True):
+        assert expected / 2 <= waited <= expected
+
+
 def _echo_language_client(monkeypatch: pytest.MonkeyPatch, fail_language: str | None = None):
     """A client that answers in whatever language was asked for.
 
@@ -426,7 +441,7 @@ async def test_rate_limited_call_backs_off_and_succeeds_on_retry(
     content = await content_generator.generate(_alert(), _household())
 
     assert create.await_count == 2
-    assert slept == [content_generator.INITIAL_BACKOFF_SECONDS]
+    _assert_backoff_window(slept, [content_generator.INITIAL_BACKOFF_SECONDS])
     # The batch is unharmed: this household got real content, not a template.
     assert content.sms_text == VALID_RESPONSE["sms_text"]
 
@@ -442,7 +457,7 @@ async def test_persistent_rate_limit_backs_off_exponentially_then_templates(
     # A rate limit earns more attempts than a malformed response does — it says
     # the request was fine, only the timing was wrong.
     assert create.await_count == content_generator.MAX_RATE_LIMIT_ATTEMPTS
-    assert slept == [1.0, 2.0, 4.0]  # doubling, not a tight retry loop
+    _assert_backoff_window(slept, [1.0, 2.0, 4.0])  # doubling, not a tight retry loop
     assert content == template_for(Severity.EVACUATE_NOW.value, "es")
 
 

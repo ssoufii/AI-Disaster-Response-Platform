@@ -24,7 +24,12 @@ from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import Channel, DeliveryStatus
 from app.schemas.ws_events import DeliveryUpdateEvent
 from app.services import content_generator, dispatcher_ws
-from tests.conftest import GATHER_CALLBACK_URL, FakeTwilio, twilio_signed_headers
+from tests.conftest import (
+    DISPATCHER_API_TOKEN,
+    GATHER_CALLBACK_URL,
+    FakeTwilio,
+    twilio_signed_headers,
+)
 
 SMS_TEXT = "Evacuate now. Go to Lincoln High School, 400 Oak St."
 
@@ -68,7 +73,8 @@ class FakeWebSocket:
     ``error`` makes the next send raise, which is how a test exercises a console
     that went away mid-dispatch. ``incoming`` is what ``receive_text`` yields
     before reporting the close; the console sends nothing, so it is normally
-    empty.
+    empty. ``closed_with`` records the code the endpoint closed it with, which is
+    how a refused handshake is told from an accepted one.
     """
 
     def __init__(self, incoming: list[str] | None = None, error: Exception | None = None) -> None:
@@ -76,9 +82,13 @@ class FakeWebSocket:
         self.sent: list[dict[str, Any]] = []
         self.incoming = list(incoming or [])
         self.error = error
+        self.closed_with: int | None = None
 
     async def accept(self) -> None:
         self.accepted = True
+
+    async def close(self, code: int = 1000) -> None:
+        self.closed_with = code
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         if self.error is not None:
@@ -179,7 +189,7 @@ async def test_endpoint_subscribes_on_connect_and_unsubscribes_on_close(
     websocket = FakeWebSocket()
 
     # Returns when the fake reports the close frame, which is the disconnect.
-    await dispatcher_ws.alert_updates(websocket, alert_id)
+    await dispatcher_ws.alert_updates(websocket, alert_id, token=DISPATCHER_API_TOKEN)
 
     assert websocket.accepted
     assert manager.subscriber_count(alert_id) == 0
@@ -200,7 +210,7 @@ async def test_endpoint_keeps_the_subscription_open_while_the_console_is_connect
         original_disconnect(*args)
 
     manager.disconnect = record_then_disconnect  # type: ignore[method-assign]
-    await dispatcher_ws.alert_updates(websocket, alert_id)
+    await dispatcher_ws.alert_updates(websocket, alert_id, token=DISPATCHER_API_TOKEN)
 
     # The subscription outlived the inbound message and ended only at the close.
     assert seen == [0]

@@ -2014,3 +2014,175 @@ async def test_status_snapshot_for_an_unknown_alert_is_404(client: AsyncClient) 
     response = await client.get(f"/alerts/{uuid.uuid4()}/status")
 
     assert response.status_code == 404
+
+
+# --- Twilio rate limits and backoff (issue #20) -------------------------------
+#
+# A zone dispatch is hundreds of sends from one account, so it is the dispatch
+# most likely to be told to slow down. What matters is that "slow down" is not
+# read as "this channel failed": a rerouted household would walk onto the next
+# channel of the *same* throttled account and spend its fallback chain on a limit
+# that would have cleared in seconds.
+
+
+class _TwilioStatusError(Exception):
+    """Stand-in for a ``TwilioRestException``.
+
+    Only ``status`` matters — that is the attribute the send path keys on, rather
+    than the SDK's exception class.
+    """
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"twilio responded {status}")
+        self.status = status
+
+
+def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Replace the backoff sleep with a recorder, so no test waits out a retry."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(delivery_service.asyncio, "sleep", fake_sleep)
+    return slept
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+async def test_a_throttled_send_is_retried_until_it_goes_through(
+    status: int, client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slept = _record_sleeps(monkeypatch)
+    twilio.messages.fail_next = [_TwilioStatusError(status), _TwilioStatusError(status)]
+
+    alert_id, _ = await _dispatch_one_sms_household(client)
+
+    # Three calls: two refusals waited out, then the send Twilio took.
+    assert twilio.messages.attempts == 3
+    assert len(twilio.messages.sent) == 1
+    assert len(slept) == 2
+    # The household is queued on its first attempt — nothing here failed, so
+    # nothing rerouted.
+    body = (await client.get(f"/alerts/{alert_id}/status")).json()
+    assert body["households"][0]["current_attempt"]["status"] == "queued"
+    assert body["households"][0]["current_attempt"]["attempt_number"] == 1
+
+
+async def test_the_waits_between_retries_double(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slept = _record_sleeps(monkeypatch)
+    twilio.messages.error = _TwilioStatusError(429)
+
+    await _dispatch_one_sms_household(client)
+
+    assert twilio.messages.attempts == delivery_service.TWILIO_MAX_ATTEMPTS
+    # Each wait is at least half its nominal size and never more than all of it:
+    # the delays are jittered so that concurrent sends do not all retry in the
+    # same instant, which would recreate the burst that caused the limit.
+    nominal = [1.0, 2.0, 4.0]
+    assert len(slept) == len(nominal)
+    for waited, expected in zip(slept, nominal, strict=True):
+        assert expected / 2 <= waited <= expected
+
+
+async def test_a_send_still_throttled_after_every_retry_fails_the_attempt(
+    client: AsyncClient, session: AsyncSession, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retries buy time; they do not make a failure into a success."""
+    _record_sleeps(monkeypatch)
+    twilio.messages.error = _TwilioStatusError(429)
+
+    alert_id, _ = await _dispatch_one_sms_household(client)
+
+    attempts = await _attempts(session, alert_id)
+    assert [attempt.status for attempt in attempts] == ["failed"]
+    assert attempts[0].error_reason is not None
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+async def test_a_send_twilio_genuinely_refuses_is_not_retried(
+    status: int, client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unroutable number does not become routable by waiting.
+
+    Retrying one would be three more seconds before the household starts down
+    the fallback chain that actually might reach it.
+    """
+    slept = _record_sleeps(monkeypatch)
+    twilio.messages.error = _TwilioStatusError(status)
+
+    await _dispatch_one_sms_household(client)
+
+    assert twilio.messages.attempts == 1
+    assert slept == []
+
+
+async def test_an_error_carrying_no_status_is_not_retried(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transport that is down is a failed attempt, which starts the fallback.
+
+    Better for the household than retrying the same dead transport: the next
+    channel is a different one.
+    """
+    slept = _record_sleeps(monkeypatch)
+    twilio.messages.error = RuntimeError("connection reset")
+
+    await _dispatch_one_sms_household(client)
+
+    assert twilio.messages.attempts == 1
+    assert slept == []
+
+
+async def test_a_throttled_call_is_retried_like_a_throttled_message(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every channel gets the same treatment — it is one account being throttled."""
+    _record_sleeps(monkeypatch)
+    twilio.calls.fail_next = [_TwilioStatusError(429)]
+
+    await _dispatch_one_voice_household(client)
+
+    assert twilio.calls.attempts == 2
+    assert len(twilio.calls.placed) == 1
+
+
+async def test_an_evacuate_now_send_is_throttled_and_retried_like_any_other(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Domain Rule 5 has nothing to skip here, and skipping would reach nobody.
+
+    The rule is about batching and pacing delays — delays applied to a send the
+    provider would have accepted. There are none. A backoff is the provider
+    having already refused, and an evacuation order that skipped it would simply
+    be refused again and again until its fallback chain ran out.
+    """
+    slept = _record_sleeps(monkeypatch)
+    twilio.messages.fail_next = [_TwilioStatusError(429)]
+
+    await _dispatch_one_sms_household(client, alert={"severity": Severity.EVACUATE_NOW.value})
+
+    assert len(slept) == 1
+    assert len(twilio.messages.sent) == 1
+
+
+async def test_a_throttled_send_says_so_in_the_log_against_its_household(
+    client: AsyncClient, twilio: FakeTwilio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every delivery-path line carries alert_id and household_id (CLAUDE.md)."""
+    _record_sleeps(monkeypatch)
+    recorder = RecordingLogger()
+    monkeypatch.setattr(delivery_service, "logger", recorder)
+    twilio.messages.fail_next = [_TwilioStatusError(429)]
+
+    alert_id, household_id = await _dispatch_one_sms_household(client)
+
+    throttled = [
+        fields for _, event, fields in recorder.calls if event == "delivery.send_throttled"
+    ]
+    assert len(throttled) == 1
+    assert throttled[0]["alert_id"] == alert_id
+    assert throttled[0]["household_id"] == household_id
+    assert throttled[0]["status"] == 429
+    assert throttled[0]["channel"] == "sms"
