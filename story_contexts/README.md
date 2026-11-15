@@ -29,3 +29,11 @@ briefing that precedes execution, not a restatement of the issue's acceptance cr
 | 18 | [18-spike-asl-delivery-decision.md](18-spike-asl-delivery-decision.md) | SPIKE: Decide ASL delivery mechanism for v1 |
 | 19 | [19-asl-video-dispatch.md](19-asl-video-dispatch.md) | Dispatch an ASL alert as a captioned video clip via WhatsApp/MMS |
 | 20 | [20-hardening-auth-ratelimit-redaction.md](20-hardening-auth-ratelimit-redaction.md) | Harden the platform: console auth, Twilio/Claude rate limiting & backoff, phone-number log redaction audit |
+| 42 | [42-simulated-twilio-adapter.md](42-simulated-twilio-adapter.md) | Simulated Twilio adapter behind delivery_service |
+| 43 | [43-template-only-content.md](43-template-only-content.md) | Template-only alert content in simulation mode |
+| 44 | [44-sqlite-startup-migrate-seed.md](44-sqlite-startup-migrate-seed.md) | Run on SQLite with schema and seed applied at startup |
+| 45 | [45-demo-scheduler.md](45-demo-scheduler.md) | Demo scheduler dispatches a mock alert every N minutes and resets nightly |
+| 46 | [46-public-read-only-console.md](46-public-read-only-console.md) | Public read-only console access in simulation mode |
+| 47 | [47-pages-console-live-backend.md](47-pages-console-live-backend.md) | Pages console connects to the live simulation backend |
+| 48 | [48-containerize-deploy-free-host.md](48-containerize-deploy-free-host.md) | Containerize and deploy the backend to a free host (Koyeb) |
+| 49 | [49-console-ui-polish.md](49-console-ui-polish.md) | Polish the console and landing page UI |

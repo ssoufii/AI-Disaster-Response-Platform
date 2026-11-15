@@ -2,7 +2,8 @@
 
 Generated from `CLAUDE.md` build order and `docs/architecture.md`.
 
-**Status: complete.** All 20 issues below are implemented and merged to `main` (PRs #21–#40).
+**Status: complete.** Issues #1–#20 are merged to `main` (PRs #21–#40). Epic 9 (#42–#49) is the
+live simulation demo, added afterwards.
 
 Points are Fibonacci (1/2/3/5/8). Issue numbers below are the real GitHub issue numbers
 (this repo's issue numbering happened to land 1:1 with the backlog order).
