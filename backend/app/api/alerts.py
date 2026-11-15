@@ -120,35 +120,35 @@ async def get_alert_status(
             select(Household).where(Household.zone_id == alert.zone_id).order_by(Household.name)
         )
     ).all()
-    latest = await delivery_service.latest_attempts_by_household(session, alert.id)
+    attempts = await delivery_service.attempts_by_household(session, alert.id)
 
     return AlertStatusRead(
         alert_id=alert.id,
         status=AlertStatus(alert.status),
         households=[
-            _household_status(household, latest.get(household.id)) for household in households
+            _household_status(household, attempts.get(household.id, [])) for household in households
         ],
     )
 
 
 def _household_status(
-    household: Household, attempt: DeliveryAttempt | None
+    household: Household, attempts: list[DeliveryAttempt]
 ) -> HouseholdDeliveryStatus:
     """One household's row in the snapshot.
 
-    ``attempt`` is None for a household with nothing attempted yet, which the
-    console shows as its own state rather than as a failure.
+    ``attempts`` is empty for a household with nothing attempted yet, which the
+    console shows as its own state rather than as a failure. The current attempt
+    is the last one: attempts are ordered by the fallback chain that produced
+    them, not by wall clock.
     """
+    history = [DeliveryAttemptRead.model_validate(a, from_attributes=True) for a in attempts]
     return HouseholdDeliveryStatus(
         household_id=household.id,
         name=household.name,
         preferred_channel=Channel(household.preferred_channel),
         last_known_status=HouseholdStatus(household.last_known_status),
-        current_attempt=(
-            DeliveryAttemptRead.model_validate(attempt, from_attributes=True)
-            if attempt is not None
-            else None
-        ),
+        current_attempt=history[-1] if history else None,
+        attempts=history,
     )
 
 

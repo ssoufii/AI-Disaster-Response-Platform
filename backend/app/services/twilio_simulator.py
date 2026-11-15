@@ -21,6 +21,7 @@ the person on the line.
 """
 
 import asyncio
+import logging
 import random
 import re
 import uuid
@@ -35,6 +36,10 @@ from twilio.request_validator import RequestValidator
 from app.config import settings
 
 logger = structlog.get_logger(__name__)
+
+# httpx announces every request at INFO. Each simulated callback is one, and the
+# webhook already logs what it did with it, so the announcement is only noise.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Twilio's magic test numbers all start with this, and each is documented as a
 # number that cannot be reached. The simulator fails every send to one, on every

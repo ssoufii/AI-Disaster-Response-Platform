@@ -102,22 +102,18 @@ function rowFromSnapshot(household: HouseholdDeliveryStatus): HouseholdRow {
     fallback_triggered: false,
     fallback_channel: null,
     updated_at: attempt?.completed_at ?? attempt?.started_at ?? null,
-    // The snapshot reports one attempt per household, so on a cold load the
-    // timeline starts there and fills in as events arrive. A resync keeps the
-    // attempts this console already saw (see `consoleReducer`) rather than
-    // throwing the audit trail away.
-    attempts:
-      attempt === null || attempt === undefined
-        ? []
-        : [
-            {
-              attempt_number: attempt.attempt_number,
-              channel: attempt.channel,
-              status: attempt.status,
-              fallback_channel: null,
-              updated_at: attempt.completed_at ?? attempt.started_at,
-            },
-          ],
+    // The snapshot lists every attempt, so a console that opens after the fact
+    // starts with the whole audit trail. Which channel a failed attempt was
+    // rerouted *to* is simply the next attempt's channel. (A backend that
+    // predates `attempts` sends only the current one; the trail then starts
+    // there and fills in as events arrive.)
+    attempts: (household.attempts ?? (attempt ? [attempt] : [])).map((entry, index, all) => ({
+      attempt_number: entry.attempt_number,
+      channel: entry.channel,
+      status: entry.status,
+      fallback_channel: all[index + 1]?.channel ?? null,
+      updated_at: entry.completed_at ?? entry.started_at,
+    })),
   };
 }
 

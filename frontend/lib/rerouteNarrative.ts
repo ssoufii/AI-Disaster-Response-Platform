@@ -45,6 +45,21 @@ export function rerouteNarrative(row: HouseholdRow): string | null {
     return `${channelLabel(row.channel ?? row.preferred_channel)} failed`;
   }
 
+  // The retry itself, still in flight. The reroute happened a moment ago and
+  // the row is now about the new attempt — but the dispatcher still needs the
+  // sentence, for as long as the outcome is open.
+  const inFlight = row.status === "queued" || row.status === "sending";
+  if (inFlight && row.attempt_number !== null && row.attempt_number > 1 && row.channel !== null) {
+    const previous = row.attempts.find(
+      (attempt) => attempt.attempt_number === (row.attempt_number as number) - 1,
+    );
+    const failed = previous?.channel ?? (row.attempt_number === 2 ? row.preferred_channel : null);
+    if (failed !== null) {
+      return `${channelLabel(failed)} failed → retrying via ${channelLabel(row.channel)}`;
+    }
+    return `Retrying via ${channelLabel(row.channel)}`;
+  }
+
   return null;
 }
 

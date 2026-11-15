@@ -43,12 +43,38 @@ export interface HouseholdDeliveryStatus {
   last_known_status: HouseholdStatus;
   /** Null when nothing has been attempted yet — not a failure, its own state. */
   current_attempt: DeliveryAttempt | null;
+  /**
+   * Every attempt for this alert, oldest first; the last is `current_attempt`.
+   * Optional so a console keeps working against a backend that predates it.
+   */
+  attempts?: DeliveryAttempt[];
 }
 
 export interface AlertStatusSnapshot {
   alert_id: string;
   status: AlertStatus;
   households: HouseholdDeliveryStatus[];
+}
+
+export type Severity = "advisory" | "warning" | "evacuate_now";
+
+/** What the dispatcher wrote: the alert itself, before any household's version. */
+export interface AlertDetails {
+  id: string;
+  title: string;
+  raw_message: string;
+  severity: Severity;
+  /** Structured facts (shelter, routes, closures). Claude may not add to these. */
+  facts: Record<string, unknown>;
+  created_at: string;
+  status: AlertStatus;
+}
+
+/** `GET /alerts/latest`: the newest dispatched alert, and where it is. */
+export interface LatestAlert extends AlertDetails {
+  zone_name: string;
+  /** Set only by the simulation demo's scheduler. */
+  next_dispatch_at: string | null;
 }
 
 /**

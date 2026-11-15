@@ -185,6 +185,13 @@ async def test_an_unreachable_household_walks_its_chain_to_unreached(
         )
     ).all()
 
+    # The snapshot carries the whole trail, so a console that opens afterwards
+    # can still show the path and not just where it ended.
+    snapshot = (await client.get(f"/alerts/{alert_id}/status")).json()
+    row = next(h for h in snapshot["households"] if h["name"] == "Okonkwo household")
+    assert [a["channel"] for a in row["attempts"]] == ["sms", "voice", "whatsapp"]
+    assert row["current_attempt"] == row["attempts"][-1]
+
     # One row per channel tried, never a mutated retry (Domain Rule 2).
     assert [(a.attempt_number, a.channel) for a in attempts] == [
         (1, "sms"),
@@ -197,7 +204,38 @@ async def test_an_unreachable_household_walks_its_chain_to_unreached(
     }
     await session.refresh(household)
     assert household.last_known_status == HouseholdStatus.UNREACHED.value
-    assert alert_id
+
+
+async def test_a_new_alert_does_not_inherit_the_last_alerts_unreached_verdict(
+    client: AsyncClient, session: AsyncSession, simulation: SimulatedTwilio
+) -> None:
+    """Unreached is about one alert's chain; the next alert starts the question over."""
+    _, zone = await _dispatch_seed_zone(client, session)
+    await _finish(simulation)
+    simulation.release.clear()  # type: ignore[attr-defined]
+
+    second = await client.post(
+        "/alerts",
+        json={
+            "title": "Second",
+            "raw_message": "x",
+            "severity": "warning",
+            "zone_id": str(zone.id),
+        },
+    )
+    second_id = second.json()["id"]
+    await client.post(f"/alerts/{second_id}/dispatch")
+
+    snapshot = (await client.get(f"/alerts/{second_id}/status")).json()
+    row = next(h for h in snapshot["households"] if h["name"] == "Okonkwo household")
+    # Nothing has failed yet on this alert, so nobody is unreached yet.
+    assert row["last_known_status"] == "unknown"
+    assert row["current_attempt"]["attempt_number"] == 1
+
+    await _finish(simulation)
+    snapshot = (await client.get(f"/alerts/{second_id}/status")).json()
+    row = next(h for h in snapshot["households"] if h["name"] == "Okonkwo household")
+    assert row["last_known_status"] == "unreached"
 
 
 async def test_a_call_nobody_confirms_is_delivered_not_confirmed(

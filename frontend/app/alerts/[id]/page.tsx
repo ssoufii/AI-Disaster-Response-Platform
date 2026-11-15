@@ -18,15 +18,9 @@ import { cookies } from "next/headers";
 import Link from "next/link";
 
 import { AlertConsole } from "@/components/AlertConsole";
-import { AlertNotFoundError, UnauthorizedError, fetchAlertStatus } from "@/lib/api";
+import { AlertNotFoundError, UnauthorizedError, fetchAlert, fetchAlertStatus } from "@/lib/api";
 import { DISPATCHER_TOKEN_COOKIE } from "@/lib/auth";
 import type { AlertStatusSnapshot } from "@/lib/types";
-
-const ALERT_STATUS_LABELS: Record<string, string> = {
-  draft: "Draft",
-  dispatching: "Dispatching",
-  completed: "Completed",
-};
 
 function Panel({
   title,
@@ -38,12 +32,12 @@ function Panel({
   signInTo?: string;
 }) {
   return (
-    <main className="mx-auto max-w-2xl px-6 py-16">
-      <h1 className="text-2xl font-semibold">{title}</h1>
-      <p className="mt-2 text-slate-600">{detail}</p>
+    <main className="mx-auto max-w-[1152px] px-4 pt-6 pb-16 sm:px-6">
+      <h1 className="text-2xl leading-8 font-semibold tracking-[-0.01em]">{title}</h1>
+      <p className="mt-3 max-w-xl text-base">{detail}</p>
       {signInTo ? (
         <Link
-          className="mt-4 inline-block rounded bg-slate-900 px-4 py-2 text-white"
+          className="pressable mt-5 inline-flex h-9 items-center rounded-md bg-ink px-4 font-medium text-surface"
           href={`/sign-in?next=${encodeURIComponent(signInTo)}`}
         >
           Sign in
@@ -98,19 +92,10 @@ export default async function AlertConsolePage({ params }: { params: Promise<{ i
     );
   }
 
-  return (
-    <main className="mx-auto max-w-5xl px-6 py-10">
-      <header className="mb-6">
-        <p className="text-sm uppercase tracking-wide text-slate-500">Dispatcher console</p>
-        <h1 className="mt-1 text-2xl font-semibold">Alert {snapshot.alert_id}</h1>
-        <p className="mt-1 text-slate-600">
-          {ALERT_STATUS_LABELS[snapshot.status] ?? snapshot.status} ·{" "}
-          {snapshot.households.length} household
-          {snapshot.households.length === 1 ? "" : "s"} in zone
-        </p>
-      </header>
+  // The alert as the dispatcher wrote it, for the title and the brief. The
+  // console is complete without it — the snapshot is what matters — so a failure
+  // here costs the heading, never the grid.
+  const alert = await fetchAlert(id, token).catch(() => null);
 
-      <AlertConsole snapshot={snapshot} token={token} />
-    </main>
-  );
+  return <AlertConsole snapshot={snapshot} token={token} alert={alert} />;
 }

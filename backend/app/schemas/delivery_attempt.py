@@ -49,6 +49,10 @@ class HouseholdDeliveryStatus(BaseModel):
     preferred_channel: Channel
     last_known_status: HouseholdStatus
     current_attempt: DeliveryAttemptRead | None = None
+    # Every attempt for this alert, oldest first; the last one is
+    # ``current_attempt``. What lets a console that loaded after the fact show
+    # the whole channel path ("SMS failed, then Voice") rather than its last step.
+    attempts: list[DeliveryAttemptRead] = []
 
 
 class TwilioStatusAck(BaseModel):

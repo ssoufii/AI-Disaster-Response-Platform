@@ -330,6 +330,15 @@ async def _deliver_to_household(
         log.warning("delivery.no_content", channel=household.preferred_channel)
         return False
 
+    if household.last_known_status == HouseholdStatus.UNREACHED.value:
+        # ``unreached`` is the verdict on an *earlier* alert's fallback chain.
+        # This is a new alert and a new chain, and nothing has been tried yet —
+        # leaving the old verdict in place would show the household red on the
+        # console before its first attempt, and count it as needing a person
+        # when it may be about to be reached. Committed with the attempt below.
+        household.last_known_status = HouseholdStatus.UNKNOWN.value
+        session.add(household)
+
     attempt = await _start_attempt(
         session, alert, household, Channel(household.preferred_channel), FIRST_ATTEMPT
     )
@@ -862,14 +871,14 @@ def _mark_failed(attempt: DeliveryAttempt, reason: str) -> None:
     attempt.error_reason = reason
 
 
-async def latest_attempts_by_household(
+async def attempts_by_household(
     session: AsyncSession, alert_id: uuid.UUID
-) -> dict[uuid.UUID, DeliveryAttempt]:
-    """The most recent attempt per household for one alert.
+) -> dict[uuid.UUID, list[DeliveryAttempt]]:
+    """Every attempt per household for one alert, in fallback-chain order.
 
-    "Most recent" is the highest ``attempt_number``: attempts are ordered by the
-    fallback chain that produced them, not by wall-clock time. The earlier rows
-    stay exactly where they are — this only picks which one the snapshot shows.
+    The audit trail itself (Domain Rule 2), so a console that opens after the
+    fact can still show which channels were tried and in what order — not only
+    where each household ended up.
     """
     attempts = (
         await session.exec(
@@ -878,4 +887,7 @@ async def latest_attempts_by_household(
             .order_by(DeliveryAttempt.attempt_number)
         )
     ).all()
-    return {attempt.household_id: attempt for attempt in attempts}
+    by_household: dict[uuid.UUID, list[DeliveryAttempt]] = {}
+    for attempt in attempts:
+        by_household.setdefault(attempt.household_id, []).append(attempt)
+    return by_household

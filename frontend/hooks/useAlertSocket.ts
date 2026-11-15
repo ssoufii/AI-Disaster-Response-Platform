@@ -33,7 +33,7 @@ import {
 
 export function useAlertSocket(
   alertId: string,
-  token: string,
+  token: string | null,
   onEvent: (event: AlertSocketEvent) => void,
   onResync: (snapshot: AlertStatusSnapshot) => void,
 ): ConnectionState {

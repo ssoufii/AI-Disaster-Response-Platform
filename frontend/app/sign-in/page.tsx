@@ -42,7 +42,7 @@ function SignInForm() {
         router.refresh();
       }}
     >
-      <label className="block text-sm font-medium text-slate-700" htmlFor="dispatcher-token">
+      <label className="block text-[13px] text-muted" htmlFor="dispatcher-token">
         Dispatcher token
       </label>
       <input
@@ -52,12 +52,12 @@ function SignInForm() {
         autoComplete="current-password"
         value={token}
         onChange={(event) => setToken(event.target.value)}
-        className="mt-1 w-full rounded border border-slate-300 px-3 py-2"
+        className="mt-1 h-9 w-full rounded-md border border-line bg-surface px-3"
       />
       <button
         type="submit"
         disabled={token.trim() === ""}
-        className="mt-4 rounded bg-slate-900 px-4 py-2 text-white disabled:opacity-50"
+        className="pressable mt-4 inline-flex h-9 items-center rounded-md bg-ink px-4 font-medium text-surface disabled:opacity-40"
       >
         Open the console
       </button>
@@ -67,10 +67,10 @@ function SignInForm() {
 
 export default function SignInPage() {
   return (
-    <main className="mx-auto max-w-md px-6 py-16">
-      <p className="text-sm uppercase tracking-wide text-slate-500">Dispatcher console</p>
-      <h1 className="mt-1 text-2xl font-semibold">Sign in</h1>
-      <p className="mt-2 text-slate-600">
+    <main className="mx-auto max-w-[1152px] px-4 pt-6 pb-16 sm:px-6">
+      <div className="max-w-sm">
+      <h1 className="text-2xl leading-8 font-semibold tracking-[-0.01em]">Sign in</h1>
+      <p className="mt-3 text-base">
         The console needs the dispatch desk&apos;s token before it can show a delivery in progress.
       </p>
       {/* `useSearchParams` reads from the request, so the form is rendered on the
@@ -78,6 +78,7 @@ export default function SignInPage() {
       <Suspense fallback={null}>
         <SignInForm />
       </Suspense>
+      </div>
     </main>
   );
 }
