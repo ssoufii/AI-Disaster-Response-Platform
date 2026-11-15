@@ -1,7 +1,8 @@
 # Backlog
 
-Generated from `CLAUDE.md` build order and `docs/architecture.md`. Repo currently contains no
-backend/frontend code — everything below starts from an empty `/backend` and `/frontend`.
+Generated from `CLAUDE.md` build order and `docs/architecture.md`.
+
+**Status: complete.** All 20 issues below are implemented and merged to `main` (PRs #21–#40).
 
 Points are Fibonacci (1/2/3/5/8). Issue numbers below are the real GitHub issue numbers
 (this repo's issue numbering happened to land 1:1 with the backlog order).
@@ -78,10 +79,3 @@ Labels: `epic`, `story`, `spike`, `chore`, `area:backend`, `area:frontend`, `are
   Twilio/Anthropic clients in tests, Alembic migration in the same commit as any model change,
   `docs/architecture.md` updated when the delivery path or WS contract changes, lint/typecheck
   clean.
-
----
-
-**Please review before I create anything on GitHub.** Once approved I will: create labels and
-milestones (idempotent), create all 20 issues via `gh issue create --body-file`, then edit each
-issue to swap title-based dependency notes for real `#<number>` links, and finish with a summary
-table.
