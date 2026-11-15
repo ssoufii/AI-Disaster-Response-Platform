@@ -2,13 +2,37 @@
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.config import settings
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
+# SQLite is what the live simulation demo runs on (an embedded file, so the demo
+# needs no hosted database). It allows one writer at a time, and a dispatch has
+# many webhooks writing at once, so a writer waits for its turn instead of
+# failing with "database is locked", and WAL lets readers carry on meanwhile.
+IS_SQLITE = settings.DATABASE_URL.startswith("sqlite")
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    future=True,
+    connect_args={"timeout": SQLITE_BUSY_TIMEOUT_SECONDS} if IS_SQLITE else {},
+)
+
+if IS_SQLITE:
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 
 async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

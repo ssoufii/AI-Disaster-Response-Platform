@@ -83,7 +83,7 @@ from app.models.alert_content import AlertContent
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import Channel, DeliveryStatus, HouseholdStatus
 from app.models.household import Household
-from app.services import asl_clips, content_generator, dispatcher_ws
+from app.services import asl_clips, content_generator, dispatcher_ws, twilio_simulator
 
 logger = structlog.get_logger(__name__)
 
@@ -229,8 +229,21 @@ async def _with_backoff(
             await asyncio.sleep(delay)
 
 
+def get_client() -> Client | twilio_simulator.SimulatedTwilio:
+    """The client every send goes through: Twilio, or its simulator.
+
+    In ``SIMULATION_MODE`` this is the simulator and the real client is never
+    built, so the public demo cannot text or call anyone whatever credentials
+    the deployment carries. The check is made on every call rather than cached,
+    because it is the one line standing between a demo and a real phone.
+    """
+    if settings.SIMULATION_MODE:
+        return twilio_simulator.get_simulator()
+    return _twilio_client()
+
+
 @lru_cache
-def get_client() -> Client:
+def _twilio_client() -> Client:
     """The process-wide Twilio client.
 
     Async-backed, because a zone dispatch sends from inside the request path and

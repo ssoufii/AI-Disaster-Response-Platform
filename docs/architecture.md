@@ -422,6 +422,44 @@ DISPATCHER_API_TOKEN= # shared dispatcher-desk token; unset closes the console a
 
 ---
 
+## 9. Live Simulation Demo (`SIMULATION_MODE`)
+
+The public demo runs the real backend with the two paid services swapped out, so
+it costs nothing and cannot contact anyone. One setting turns it on; with it off
+(the default) none of this code runs.
+
+| Part | Real deployment | Simulation mode |
+|---|---|---|
+| Twilio client | `twilio.rest.Client` | `services/twilio_simulator.py` — the real client is never built |
+| Alert content | Claude API | Pre-written severity + language templates (no API call) |
+| Database | PostgreSQL | SQLite file, migrated and seeded at startup (60 households, 3 zones) |
+| Who dispatches | A dispatcher | `services/demo_scheduler.py`, every `DEMO_DISPATCH_INTERVAL_MINUTES` |
+| Console access | Dispatcher token | `GET /alerts/latest`, `GET /alerts/{id}/status` and the alert WebSocket are public; everything else still needs the token |
+
+**The delivery path is unchanged.** The simulator only imitates Twilio from the
+outside: a send returns a SID, and the statuses then arrive as signed POSTs to
+the same `/webhooks/twilio/status` and `/webhooks/twilio/voice-confirmation`
+endpoints. Signature validation, idempotency, fallback rerouting, `unreached`
+marking and every WebSocket event are the production code. The signing token is
+a random per-process secret, so only the simulator can produce a valid callback.
+
+**Outcomes.** Each channel fails at a configurable rate (`SIM_*_RATE`). Numbers
+starting `+1500555` (Twilio's magic test numbers) always fail on every channel,
+so each zone has one household that reaches `unreached`. An answered call
+presses 1 at `SIM_VOICE_CONFIRM_RATE`; that keypress, posted to the real
+confirmation webhook, is still the only source of `confirmed_received`.
+
+**The scheduler is not fallback polling.** It decides when the next *alert*
+starts, one at a time, from a fixed hand-written pool (facts are constants, per
+Domain Rule 1). Rerouting is still triggered by the status webhook. Once a day
+(`DEMO_RESET_HOUR_UTC`) it wipes and re-seeds the database.
+
+**`GET /alerts/latest`** returns the newest dispatched alert plus `zone_name`
+and, in simulation mode, `next_dispatch_at`. It is how a console with no alert
+id finds what to show.
+
+---
+
 ## Open Design Decisions to Make Early
 
 - **ASL delivery**: pre-recorded human interpreter clips per template message vs. AI avatar generation — affects scope a lot. Starting with a small library of pre-recorded common-phrase clips + Claude only writing captions is far more buildable than generating video. *(**Decided** — see "Decision: ASL delivery" below.)*

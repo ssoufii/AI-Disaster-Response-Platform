@@ -28,6 +28,13 @@ class AlertNotFoundError(NotFoundError):
         super().__init__("Alert", alert_id)
 
 
+class NoDispatchedAlertError(NotFoundError):
+    """``GET /alerts/latest`` was asked before anything had been dispatched."""
+
+    def __init__(self) -> None:
+        DomainError.__init__(self, "No alert has been dispatched yet")
+
+
 class ContentGenerationError(DomainError):
     """Claude returned something that is not valid alert content.
 

@@ -3,20 +3,25 @@
 import uuid
 
 from fastapi import APIRouter, Depends, status
-from sqlmodel import select
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.db import get_session
-from app.exceptions import AlertNotFoundError, ZoneNotFoundError
+from app.exceptions import AlertNotFoundError, NoDispatchedAlertError, ZoneNotFoundError
 from app.models.alert import Alert
-from app.models.alert_content import AlertContent
 from app.models.delivery_attempt import DeliveryAttempt
 from app.models.enums import AlertStatus, Channel, HouseholdStatus
 from app.models.household import Household
 from app.models.zone import Zone
-from app.schemas.alert import AlertCreate, AlertDispatchRead, AlertRead, AlertStatusRead
+from app.schemas.alert import (
+    AlertCreate,
+    AlertDispatchRead,
+    AlertLatestRead,
+    AlertRead,
+    AlertStatusRead,
+)
 from app.schemas.delivery_attempt import DeliveryAttemptRead, HouseholdDeliveryStatus
-from app.services import content_generator, delivery_service
+from app.services import delivery_service, demo_scheduler, dispatch
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -64,44 +69,32 @@ async def dispatch_alert(
     if alert is None:
         raise AlertNotFoundError(alert_id)
 
-    households = (
-        await session.exec(select(Household).where(Household.zone_id == alert.zone_id))
-    ).all()
-    already_generated = set(
-        (
-            await session.exec(
-                select(AlertContent.household_id).where(AlertContent.alert_id == alert.id)
-            )
-        ).all()
-    )
-    pending = [h for h in households if h.id not in already_generated]
+    return await dispatch.dispatch_alert(session, alert)
 
-    contents = await content_generator.generate_for_zone(alert, pending)
-    for household, content in zip(pending, contents, strict=True):
-        session.add(
-            AlertContent(
-                alert_id=alert.id,
-                household_id=household.id,
-                channel=household.preferred_channel,
-                generated_text=content.sms_text,
-                generated_script=content.voice_script,
-                video_caption_text=content.asl_video_caption,
-                language=content.language_used,
-            )
+
+@router.get("/latest", response_model=AlertLatestRead)
+async def get_latest_alert(session: AsyncSession = Depends(get_session)) -> AlertLatestRead:
+    """The most recently dispatched alert — where a console with no id starts.
+
+    Drafts are skipped: a draft has no deliveries to watch. Declared before
+    ``/{alert_id}`` so "latest" is not read as an id.
+    """
+    alert = (
+        await session.exec(
+            select(Alert)
+            .where(Alert.status != AlertStatus.DRAFT.value)
+            .order_by(col(Alert.created_at).desc())
+            .limit(1)
         )
+    ).first()
+    if alert is None:
+        raise NoDispatchedAlertError()
 
-    alert.status = AlertStatus.DISPATCHING.value
-    session.add(alert)
-    await session.commit()
-
-    deliveries_started = await delivery_service.deliver_alert(session, alert, households)
-
-    return AlertDispatchRead(
-        alert_id=alert.id,
-        status=AlertStatus(alert.status),
-        households=len(households),
-        content_generated=len(pending),
-        deliveries_started=deliveries_started,
+    zone = await session.get(Zone, alert.zone_id)
+    return AlertLatestRead(
+        **AlertRead.model_validate(alert, from_attributes=True).model_dump(),
+        zone_name=zone.name if zone is not None else "",
+        next_dispatch_at=demo_scheduler.next_dispatch_at(),
     )
 
 
