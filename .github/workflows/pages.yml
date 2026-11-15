@@ -1,0 +1,70 @@
+# Publishes the frontend's scripted demo to GitHub Pages.
+#
+# Pages serves static files only, and there is no backend behind it, so this
+# builds a static export (see frontend/next.config.ts) after removing the
+# routes that need a server: the live console reads a cookie and fetches from
+# the API at request time, and sign-in only exists to feed it. What is left is
+# the home page and /demo, which plays a scripted dispatch through the real
+# console components.
+
+name: Deploy demo to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 22.18+ runs the .mts tests without flags.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+
+      - name: Remove server-only routes
+        run: rm -rf app/alerts app/sign-in
+
+      - name: Build static export
+        run: npm run build
+        env:
+          PAGES_BASE_PATH: /${{ github.event.repository.name }}
+          NEXT_PUBLIC_STATIC_DEMO: "1"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
