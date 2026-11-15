@@ -93,6 +93,26 @@ def _presented_token(authorization: str | None) -> str | None:
     return authorization.removeprefix(BEARER_PREFIX).strip() or None
 
 
+# What the public simulation demo lets anyone read without a token: which alert
+# is live, and its delivery snapshot. Route templates, matched exactly, and GET
+# only — so everything that creates, dispatches or changes anything stays behind
+# the token, and so does every route added later unless it is listed here. The
+# household and zone registers are not listed: watching the demo needs neither.
+PUBLIC_DEMO_READS = frozenset({"/alerts/latest", "/alerts/{alert_id}/status"})
+
+
+def _is_public_demo_read(request: Request) -> bool:
+    """Whether this is one of the demo's public reads, in simulation mode.
+
+    Only ever true in ``SIMULATION_MODE``, where every household is invented.
+    A real deployment has that switch off and this function is always false.
+    """
+    if not settings.SIMULATION_MODE or request.method != "GET":
+        return False
+    route = request.scope.get("route")
+    return getattr(route, "path", None) in PUBLIC_DEMO_READS
+
+
 async def require_dispatcher(request: Request) -> None:
     """Refuse the request unless it carries the dispatcher token.
 
@@ -101,6 +121,9 @@ async def require_dispatcher(request: Request) -> None:
     to forget. It returns nothing: there is one identity, and knowing the caller
     holds the token is the whole of what any route needs.
     """
+    if _is_public_demo_read(request):
+        return
+
     if _token_configured() is None:
         logger.error("dispatcher_auth.token_unconfigured", path=request.url.path)
         raise HTTPException(
@@ -135,6 +158,11 @@ async def authorize_console_socket(websocket: WebSocket, token: str | None) -> b
     later — an unauthenticated console is never in the registry at all, so no
     ``delivery_update`` can reach it.
     """
+    if settings.SIMULATION_MODE:
+        # The demo's console is public and the socket is read-only by nature:
+        # the server never acts on anything a subscriber sends.
+        return True
+
     if _token_configured() is None:
         logger.error("dispatcher_auth.socket_token_unconfigured")
         await websocket.close(code=WS_UNAUTHORIZED_CODE)

@@ -15,7 +15,7 @@
 
 import { authHeaders } from "@/lib/auth";
 import { API_BASE_URL } from "@/lib/env";
-import type { AlertStatusSnapshot } from "@/lib/types";
+import type { AlertDetails, AlertStatusSnapshot, LatestAlert } from "@/lib/types";
 
 export class AlertNotFoundError extends Error {}
 
@@ -48,4 +48,34 @@ export async function fetchAlertStatus(
   }
 
   return (await response.json()) as AlertStatusSnapshot;
+}
+
+/** The alert as the dispatcher wrote it. Console-only: needs the token. */
+export async function fetchAlert(alertId: string, token: string | null): Promise<AlertDetails> {
+  const response = await fetch(`${API_BASE_URL}/alerts/${alertId}`, {
+    cache: "no-store",
+    headers: authHeaders(token),
+  });
+  if (!response.ok) {
+    throw new Error(`GET /alerts/${alertId} responded ${response.status}`);
+  }
+  return (await response.json()) as AlertDetails;
+}
+
+/**
+ * The most recently dispatched alert, or null when nothing has been dispatched.
+ *
+ * What the public demo console opens with: it has no alert id of its own, so it
+ * asks which one is live. Throws when the backend cannot be reached, which the
+ * demo shows as "waking up" rather than as an empty console.
+ */
+export async function fetchLatestAlert(): Promise<LatestAlert | null> {
+  const response = await fetch(`${API_BASE_URL}/alerts/latest`, { cache: "no-store" });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`GET /alerts/latest responded ${response.status}`);
+  }
+  return (await response.json()) as LatestAlert;
 }

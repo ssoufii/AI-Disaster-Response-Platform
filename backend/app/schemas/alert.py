@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.models.enums import AlertStatus, Severity
-from app.schemas.delivery_attempt import HouseholdDeliveryStatus
+from app.schemas.delivery_attempt import HouseholdDeliveryStatus, UtcDatetime
 
 
 class AlertCreate(BaseModel):
@@ -65,5 +65,17 @@ class AlertRead(BaseModel):
     facts: dict[str, Any]
     zone_id: uuid.UUID
     created_by: str | None = None
-    created_at: datetime
+    created_at: UtcDatetime
     status: AlertStatus
+
+
+class AlertLatestRead(AlertRead):
+    """The most recently dispatched alert, with what a console needs to open it.
+
+    ``zone_name`` saves the console a second request. ``next_dispatch_at`` is
+    only set by the simulation demo's scheduler, so its console can say when
+    the next mock alert is due; it is null everywhere else.
+    """
+
+    zone_name: str
+    next_dispatch_at: datetime | None = None

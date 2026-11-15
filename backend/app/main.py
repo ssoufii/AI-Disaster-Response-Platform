@@ -1,5 +1,9 @@
 """FastAPI application: router registration and domain-exception translation."""
 
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -9,12 +13,31 @@ from app.auth import require_dispatcher
 from app.config import settings
 from app.exceptions import NotFoundError
 from app.logging_config import configure_logging
-from app.services import dispatcher_ws
+from app.services import demo_scheduler, dispatcher_ws, twilio_simulator
 from app.webhooks import twilio_status
 
 configure_logging()
 
-app = FastAPI(title="AI Disaster Response Platform")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    """Start the simulation demo's scheduler — in ``SIMULATION_MODE`` only.
+
+    A real deployment has that switch off and this does nothing at all: its
+    schema comes from ``alembic upgrade head`` and its dispatches from a
+    dispatcher.
+    """
+    scheduler: asyncio.Task[None] | None = None
+    if settings.SIMULATION_MODE:
+        await demo_scheduler.prepare_database()
+        scheduler = asyncio.create_task(demo_scheduler.run_forever())
+    yield
+    if scheduler is not None:
+        scheduler.cancel()
+        await twilio_simulator.get_simulator().cancel()
+
+
+app = FastAPI(title="AI Disaster Response Platform", lifespan=lifespan)
 
 # The console reads GET /alerts/{id}/status from the browser when it resyncs
 # after a dropped socket, and it is served from its own origin. Without this the

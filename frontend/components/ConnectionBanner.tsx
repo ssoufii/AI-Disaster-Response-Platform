@@ -19,10 +19,11 @@ export function ConnectionBanner({ state }: { state: ConnectionState }) {
     <div
       role="status"
       aria-live="polite"
-      className="mb-4 flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-amber-900"
+      data-tone="amber"
+      className="narrative mb-3 flex items-start gap-3 rounded-lg bg-[var(--tone-bg)] px-4 py-3 text-[var(--tone-ink)]"
     >
-      <span className="mt-1.5 h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500" aria-hidden />
-      <p className="text-sm">
+      <span className="tone-dot live-dot mt-2" aria-hidden />
+      <p>
         <span className="font-medium">Connection lost — reconnecting.</span> Statuses below may be
         out of date. Delivery is unaffected; this console is.
       </p>

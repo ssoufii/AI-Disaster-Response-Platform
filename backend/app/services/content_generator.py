@@ -135,6 +135,21 @@ async def generate(
     """
     log = logger.bind(alert_id=str(alert.id), household_id=str(household.id))
     channel = channel or household.preferred_channel
+
+    if settings.SIMULATION_MODE:
+        # The public demo runs nonstop and the Claude API is not free, so it
+        # sends the pre-written templates on purpose. Logged at info, under its
+        # own name: this is the configured mode, not a generation failure, and
+        # must not read like one to someone scanning for template fallbacks.
+        content = template_for(alert.severity, household.language)
+        log.info(
+            "content_generation.template_simulation",
+            content_source="template_simulation",
+            severity=alert.severity,
+            language_used=content.language_used,
+        )
+        return content
+
     attempt = 0
 
     while True:

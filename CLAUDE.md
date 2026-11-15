@@ -34,6 +34,9 @@ Full architecture and data model: `docs/architecture.md`. Read it before making 
       content_generator.py  # ALL Claude API calls
       delivery_service.py   # ALL Twilio calls + fallback rerouting
       dispatcher_ws.py      # WebSocket connection manager
+      dispatch.py           # generate-then-deliver, shared by the route and the demo scheduler
+      twilio_simulator.py   # SIMULATION_MODE only: stands in for Twilio
+      demo_scheduler.py     # SIMULATION_MODE only: dispatches mock alerts on a timer
     webhooks/
       twilio_status.py      # POST /webhooks/twilio/status
     models/                 # SQLModel table definitions
@@ -248,7 +251,9 @@ DATABASE_URL=
 PUBLIC_BASE_URL=          # ngrok URL in dev; required for Twilio callbacks
 CONSOLE_ORIGINS=          # comma-separated console origins allowed to read the API from the browser
 NEXT_PUBLIC_API_URL=
-NEXT_PUBLIC_WS_URL=
+NEXT_PUBLIC_WS_URL=      # optional; derived from NEXT_PUBLIC_API_URL when unset
+SIMULATION_MODE=false    # true = fake Twilio, template content, public read-only console (docs/architecture.md §9)
+NEXT_PUBLIC_LIVE_DEMO=   # 1 = the site's root is the public demo console
 ```
 
 Never commit `.env`. Keep `.env.example` in sync when adding a variable.

@@ -9,7 +9,7 @@ import type { NextConfig } from "next";
  * The GitHub Pages build (`.github/workflows/pages.yml`) sets `PAGES_BASE_PATH`
  * and exports a static site instead. Pages has no server and no backend, so
  * that workflow removes the server-only routes before building and publishes
- * the home page and the scripted `/demo`.
+ * the home page, which in that build is the live demo console.
  */
 const pagesBasePath = process.env.PAGES_BASE_PATH;
 

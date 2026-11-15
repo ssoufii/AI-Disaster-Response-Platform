@@ -184,7 +184,7 @@ This loop is what the resume line "re-routing failed deliveries to a fallback ch
 - The status is committed **before** the broadcast, so no console is shown a household the database has not accepted as unreached.
 - **The attempt rows are not touched.** Exhaustion is a verdict about the household written *beside* the chain, never over it (Domain Rule 2) — every attempt keeps its own status, `error_reason` and timestamps, and no new attempt is created.
 - A household with channels still left in `fallback_channel_order` is never marked: the chain simply continues. A household whose `fallback_channel_order` is empty *is* marked on its first failure — the preferred channel was its whole chain.
-- `last_known_status` lives on the household, not on the attempt, which is what the console colours red (#14) and what `GET /alerts/{id}/status` reports on a reload. It is a household-level column, so it is not scoped to one alert: a household marked `unreached` stays so until something sets it otherwise, and nothing does yet. Clearing it (on a later `delivered`, or per-alert) is not in #13's scope.
+- `last_known_status` lives on the household, not on the attempt, which is what the console colours red (#14) and what `GET /alerts/{id}/status` reports on a reload. It is a household-level column, so it is not scoped to one alert: a household marked `unreached` stays so until the next alert's first attempt for it, which resets it to `unknown` — the verdict belonged to the earlier alert's chain, and a new alert has not failed yet. It is not cleared by a later `delivered`.
 - The webhook's idempotency guard sits upstream of the reroute, so a retried failure callback cannot re-mark or re-announce a household that is already unreached.
 
 **Implementation notes** (`backend/app/services/delivery_service.py`):
@@ -287,7 +287,7 @@ Key endpoints:
     }
   }
   ```
-  `current_attempt` is the household's highest `attempt_number` — attempts are ordered by the fallback chain that produced them, not by wall clock. Earlier attempts stay exactly where they are; this only picks which one the snapshot shows. The full per-household attempt history is the DeliveryTimeline's (#14).
+  `current_attempt` is the household's highest `attempt_number` — attempts are ordered by the fallback chain that produced them, not by wall clock. Earlier attempts stay exactly where they are; this only picks which one the snapshot shows. Each household also carries `attempts`: every attempt for this alert, oldest first (the last is `current_attempt`), so a console that loads after the fact can show the whole channel path rather than only its last step.
 - `WS /ws/alerts/{id}` — dispatcher console subscribes here for live updates; the handshake is refused (close 1008) without the dispatcher token
 - `POST /webhooks/twilio/status` — Twilio calls this on every delivery state change; a request whose `X-Twilio-Signature` does not validate is refused with a 403 before any state is touched
 - `POST /webhooks/twilio/voice-confirmation` — the voice call's `<Gather>` action URL: Twilio posts the digit the household pressed, `1` marks that attempt `confirmed_received`, and the response is TwiML. Signature-validated against its own URL, and refused with a 403 the same way
@@ -379,7 +379,7 @@ Key endpoints:
 - An event for a household the snapshot did not contain is dropped: it joined the zone after the page loaded, and a reconnect resync is what picks it up.
 - `lib/statusTone.ts` is the single place the four colours are decided. Red is read from the household's `last_known_status`, not from any attempt, because "unreached" is a statement about the household after its whole fallback chain ran out (#13). Amber is any attempt annotated with a fallback, whatever the failing status was called, so a terminal status added to the chain later does not leave a household being retried looking grey.
 - `lib/rerouteNarrative.ts` turns the same row into the sentence beside it — "SMS failed → retrying via Voice", or "All channels tried after 2 attempts — needs human follow-up" (#14). Built from the event payload's `fallback_triggered`/`fallback_channel` rather than from what the console remembers, so a console that connected mid-dispatch prints the same words as one that watched the whole thing. A colour alone is something a dispatcher has to decode under time pressure; that is why the words are required by CLAUDE.md's Frontend Conventions and not left to the palette.
-- `HouseholdRow.attempts` accumulates one entry per `attempt_number`, which `components/DeliveryTimeline.tsx` lists oldest-first in a `<details>` disclosure per household. Attempts accumulate rather than flip in place because a fallback creates a *new* DeliveryAttempt and never mutates the failed one (Domain Rule 2) — a single status changing colour would be a different claim about what happened. A resync keeps the attempts the console already saw and lets the snapshot decide only where the household stands now: an observed attempt is a committed row nothing rewrites, while `GET /alerts/{id}/status` reports one current attempt per household and cannot restore a history.
+- `HouseholdRow.attempts` accumulates one entry per `attempt_number`, which the grid's "Channel path" column prints oldest-first ("~~SMS~~ → Voice"), seeded from the snapshot's `attempts`. Attempts accumulate rather than flip in place because a fallback creates a *new* DeliveryAttempt and never mutates the failed one (Domain Rule 2) — a single status changing colour would be a different claim about what happened. A resync keeps the attempts the console already saw and lets the snapshot decide only where the household stands now: an observed attempt is a committed row nothing rewrites, and the snapshot's own `attempts` list fills in any the console missed.
 - `useAlertSocket.ts` holds its handlers in a ref so a new inline callback per render does not tear the socket down, ignores frames it cannot parse or whose `type` it does not know, and returns the connection state the banner renders from. The lifecycle underneath it lives in `lib/alertSocketController.ts`.
 - `lib/alertSocketController.ts` owns connect → drop → backoff → reconnect → resync, deliberately outside React and outside the browser: the socket, the snapshot fetch and the timer all arrive as arguments, which is what makes the backoff schedule and the resync observable in `frontend/tests/` without a DOM or a live server. Three rules it exists to enforce:
   - **A drop is reported before the retry is waited out**, not after. At the tail of the schedule "after" is half a minute of a console that looks fine and is not.
@@ -419,6 +419,44 @@ PUBLIC_BASE_URL=   # for Twilio webhook callbacks
 CONSOLE_ORIGINS=   # comma-separated console origins allowed to read the API from the browser
 DISPATCHER_API_TOKEN= # shared dispatcher-desk token; unset closes the console and its APIs
 ```
+
+---
+
+## 9. Live Simulation Demo (`SIMULATION_MODE`)
+
+The public demo runs the real backend with the two paid services swapped out, so
+it costs nothing and cannot contact anyone. One setting turns it on; with it off
+(the default) none of this code runs.
+
+| Part | Real deployment | Simulation mode |
+|---|---|---|
+| Twilio client | `twilio.rest.Client` | `services/twilio_simulator.py` — the real client is never built |
+| Alert content | Claude API | Pre-written severity + language templates (no API call) |
+| Database | PostgreSQL | SQLite file, migrated and seeded at startup (60 households, 3 zones) |
+| Who dispatches | A dispatcher | `services/demo_scheduler.py`, every `DEMO_DISPATCH_INTERVAL_MINUTES` |
+| Console access | Dispatcher token | `GET /alerts/latest`, `GET /alerts/{id}/status` and the alert WebSocket are public; everything else still needs the token |
+
+**The delivery path is unchanged.** The simulator only imitates Twilio from the
+outside: a send returns a SID, and the statuses then arrive as signed POSTs to
+the same `/webhooks/twilio/status` and `/webhooks/twilio/voice-confirmation`
+endpoints. Signature validation, idempotency, fallback rerouting, `unreached`
+marking and every WebSocket event are the production code. The signing token is
+a random per-process secret, so only the simulator can produce a valid callback.
+
+**Outcomes.** Each channel fails at a configurable rate (`SIM_*_RATE`). Numbers
+starting `+1500555` (Twilio's magic test numbers) always fail on every channel,
+so each zone has one household that reaches `unreached`. An answered call
+presses 1 at `SIM_VOICE_CONFIRM_RATE`; that keypress, posted to the real
+confirmation webhook, is still the only source of `confirmed_received`.
+
+**The scheduler is not fallback polling.** It decides when the next *alert*
+starts, one at a time, from a fixed hand-written pool (facts are constants, per
+Domain Rule 1). Rerouting is still triggered by the status webhook. Once a day
+(`DEMO_RESET_HOUR_UTC`) it wipes and re-seeds the database.
+
+**`GET /alerts/latest`** returns the newest dispatched alert plus `zone_name`
+and, in simulation mode, `next_dispatch_at`. It is how a console with no alert
+id finds what to show.
 
 ---
 

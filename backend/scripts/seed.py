@@ -155,6 +155,110 @@ async def seed_demo_data(session: AsyncSession) -> tuple[Zone, list[Household]]:
     return zone, households
 
 
+# --- Simulation demo data (Epic 9) -----------------------------------------
+#
+# The live demo needs more than five households to look like a dispatch: three
+# zones of twenty. The first zone keeps the five required profiles above; the
+# rest are generated from the tables below, deterministically, so every boot
+# and every nightly reset produces the same sixty households.
+
+SIMULATION_ZONE_NAMES: tuple[str, ...] = (
+    SEED_ZONE_NAME,
+    "Cedar Ridge Wildfire Corridor",
+    "Harbor Point Coastal Zone",
+)
+SIMULATION_HOUSEHOLDS_PER_ZONE = 20
+
+# Two more of Twilio's magic unreachable numbers, one per extra zone, so every
+# zone has a household that walks its whole fallback chain to ``unreached``.
+EXTRA_UNREACHABLE_NUMBERS: tuple[str, ...] = ("+15005550001", "+15005550002")
+
+_SURNAMES: dict[str, tuple[str, ...]] = {
+    "en": (
+        "Abbott", "Brennan", "Castillo", "Dawson", "Ellis", "Foster", "Grant", "Hughes",
+        "Iverson", "Jensen", "Keller", "Lawson", "Morgan", "Nakamura", "Osei", "Patel",
+        "Quinn", "Reyes", "Sato", "Turner", "Underwood", "Vance", "Walsh", "Young",
+    ),
+    "es": (
+        "Aguilar", "Benitez", "Cordero", "Delgado", "Espinoza", "Fuentes", "Galindo",
+        "Herrera", "Ibarra", "Jimenez", "Lozano", "Mendoza", "Navarro", "Ortega",
+    ),
+    "vi": ("Bui", "Dang", "Ho", "Huynh", "Le", "Ngo", "Nguyen", "Pham", "Vo", "Vu"),
+}  # fmt: skip
+
+# (language, literacy, preferred channel, fallback order, accessibility needs)
+_PROFILES: tuple[tuple[str, LiteracyLevel, Channel, tuple[Channel, ...], tuple[str, ...]], ...] = (
+    ("en", LiteracyLevel.STANDARD, Channel.SMS, (Channel.VOICE,), ()),
+    ("es", LiteracyLevel.STANDARD, Channel.VOICE, (Channel.SMS,), ()),
+    ("en", LiteracyLevel.LOW_LITERACY, Channel.SMS, (Channel.VOICE, Channel.WHATSAPP), ()),
+    ("vi", LiteracyLevel.STANDARD, Channel.SMS, (Channel.VOICE,), ()),
+    ("en", LiteracyLevel.STANDARD, Channel.VIDEO, (Channel.WHATSAPP, Channel.SMS), ("asl", "deaf")),
+    ("es", LiteracyLevel.LOW_LITERACY, Channel.VOICE, (Channel.SMS, Channel.WHATSAPP), ()),
+    ("en", LiteracyLevel.STANDARD, Channel.VOICE, (Channel.SMS,), ()),
+    ("es", LiteracyLevel.STANDARD, Channel.SMS, (Channel.VOICE,), ()),
+    ("en", LiteracyLevel.STANDARD, Channel.WHATSAPP, (Channel.SMS, Channel.VOICE), ()),
+    ("vi", LiteracyLevel.STANDARD, Channel.VOICE, (Channel.SMS,), ()),
+)
+
+
+def simulation_seeds() -> dict[str, tuple[HouseholdSeed, ...]]:
+    """Every simulation household, grouped by the zone it lives in."""
+    used: dict[str, int] = {"en": 0, "es": 0, "vi": 0}
+    zones: dict[str, tuple[HouseholdSeed, ...]] = {}
+
+    for zone_index, zone_name in enumerate(SIMULATION_ZONE_NAMES):
+        seeds: list[HouseholdSeed] = list(HOUSEHOLD_SEEDS) if zone_index == 0 else []
+        if zone_index > 0:
+            seeds.append(
+                HouseholdSeed(
+                    name=f"{_SURNAMES['en'][-zone_index]} household",
+                    phone_number=EXTRA_UNREACHABLE_NUMBERS[zone_index - 1],
+                    language="en",
+                    literacy_level=LiteracyLevel.STANDARD,
+                    preferred_channel=Channel.SMS,
+                    fallback_channel_order=(Channel.VOICE, Channel.WHATSAPP),
+                )
+            )
+        slot = 0
+        while len(seeds) < SIMULATION_HOUSEHOLDS_PER_ZONE:
+            language, literacy, channel, fallbacks, needs = _PROFILES[
+                (slot + zone_index * 3) % len(_PROFILES)
+            ]
+            surnames = _SURNAMES[language]
+            seeds.append(
+                HouseholdSeed(
+                    name=f"{surnames[used[language] % len(surnames)]} household",
+                    phone_number=f"+1555011{zone_index}{slot:03d}",
+                    language=language,
+                    literacy_level=literacy,
+                    preferred_channel=channel,
+                    fallback_channel_order=fallbacks,
+                    accessibility_needs=needs,
+                )
+            )
+            used[language] += 1
+            slot += 1
+        zones[zone_name] = tuple(seeds)
+
+    return zones
+
+
+async def seed_simulation_data(session: AsyncSession) -> int:
+    """Seed the simulation demo's zones and households. Returns households seeded.
+
+    Idempotent for the same reason ``seed_demo_data`` is: zones are keyed on
+    name and households on phone number.
+    """
+    count = 0
+    for zone_name, seeds in simulation_seeds().items():
+        zone = await get_or_create_zone(session, zone_name)
+        for seed in seeds:
+            await upsert_household(session, seed, zone)
+            count += 1
+    await session.commit()
+    return count
+
+
 async def main() -> None:
     configure_logging()
     async with async_session_factory() as session:

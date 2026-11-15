@@ -1,24 +1,201 @@
 @import "tailwindcss";
 
+/*
+ * The console's look, in one place.
+ *
+ * The chrome carries no colour at all — ground, surfaces, ink and grey. The
+ * only hues on screen are the four status tones CLAUDE.md fixes the meaning of
+ * (green delivered, amber rerouting, red unreached, grey in flight), so a
+ * coloured thing is always a statement about a household.
+ *
+ * Dark mode is the same roles on true neutral darks, not a second design.
+ */
 :root {
-  --background: #f8fafc;
-  --foreground: #0f172a;
+  --ground: #f2f4f7;
+  --surface: #ffffff;
+  --raised: #e9ecf0;
+  --line: #e3e6ea;
+  --rule: #eef0f3;
+  --ink: #0a0a0a;
+  --muted: #5f6672;
+
+  --green: #23803a;
+  --amber: #b26a00;
+  --red: #c4242a;
+  --grey: #8b919b;
+
+  --pill-green-bg: #dcfae5;
+  --pill-green-ink: #04250e;
+  --pill-amber-bg: #fff4d6;
+  --pill-amber-ink: #6b3d00;
+  --pill-red-bg: #ffe9e6;
+  --pill-red-ink: #831c1e;
+  --pill-grey-bg: #e9ecf0;
+  --pill-grey-ink: #3a3f47;
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #0a0a0a;
+    --surface: #141414;
+    --raised: #1f1f1f;
+    --line: #2a2a2a;
+    --rule: #1f1f1f;
+    --ink: #f2f2f2;
+    --muted: #a3a3a3;
+
+    --green: #3fb760;
+    --amber: #e0a020;
+    --red: #f0625a;
+    --grey: #8a8a8a;
+
+    --pill-green-bg: #10291a;
+    --pill-green-ink: #a6e9b9;
+    --pill-amber-bg: #2b2008;
+    --pill-amber-ink: #f2c66d;
+    --pill-red-bg: #351415;
+    --pill-red-ink: #ffb4ae;
+    --pill-grey-bg: #1f1f1f;
+    --pill-grey-ink: #c8c8c8;
+  }
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-ground: var(--ground);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-rule: var(--rule);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-tone-green: var(--green);
+  --color-tone-amber: var(--amber);
+  --color-tone-red: var(--red);
+  --color-tone-grey: var(--grey);
+  --font-sans: var(--font-geist), Inter, system-ui, sans-serif;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family:
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    Roboto,
-    Helvetica,
-    Arial,
-    sans-serif;
+  background: var(--ground);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Anything that counts or updates lines up digit for digit. */
+.figures {
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Status tones ---------------------------------------------------------
+   One attribute decides a tone everywhere it appears: the pill, its dot, the
+   cell in the reach strip. Colours cross-fade when a household's state changes
+   so the eye sees one thing changing rather than two things swapping. */
+
+[data-tone="green"] {
+  --tone: var(--green);
+  --tone-bg: var(--pill-green-bg);
+  --tone-ink: var(--pill-green-ink);
+}
+[data-tone="amber"] {
+  --tone: var(--amber);
+  --tone-bg: var(--pill-amber-bg);
+  --tone-ink: var(--pill-amber-ink);
+}
+[data-tone="red"] {
+  --tone: var(--red);
+  --tone-bg: var(--pill-red-bg);
+  --tone-ink: var(--pill-red-ink);
+}
+[data-tone="grey"] {
+  --tone: var(--grey);
+  --tone-bg: var(--pill-grey-bg);
+  --tone-ink: var(--pill-grey-ink);
+}
+
+.pill {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--tone-bg);
+  color: var(--tone-ink);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition:
+    background-color 200ms ease,
+    color 200ms ease;
+}
+
+.tone-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--tone);
+  transition: background-color 200ms ease;
+}
+
+.strip-cell {
+  flex: 1 1 0;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--tone);
+  transition: background-color 250ms ease;
+}
+
+/* The sentence that explains a reroute arrives; it does not pop. Small travel,
+   fast, and only on entry — these appear many times a minute. */
+.narrative {
+  transition:
+    opacity 200ms var(--ease-out),
+    transform 200ms var(--ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* The "live" dot breathes while the socket is up. */
+@keyframes live-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+.live-dot {
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+/* Anything pressable answers the press. */
+.pressable {
+  transition:
+    transform 140ms var(--ease-out),
+    background-color 150ms ease;
+}
+.pressable:active {
+  transform: scale(0.97);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .narrative {
+    transition: opacity 200ms ease;
+
+    @starting-style {
+      opacity: 0;
+      transform: none;
+    }
+  }
+  .live-dot {
+    animation: none;
+  }
+  .pressable:active {
+    transform: none;
+  }
 }

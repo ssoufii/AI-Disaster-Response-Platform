@@ -8,4 +8,9 @@
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-export const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000";
+/**
+ * The socket's base URL. Given explicitly, or else the API's with the scheme
+ * swapped (http → ws, https → wss) — they are the same server, and deriving it
+ * leaves a deployment one URL to configure instead of two that must agree.
+ */
+export const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL ?? API_BASE_URL.replace(/^http/, "ws");
