@@ -93,15 +93,15 @@ export function AlertConsole({
   alert = null,
   zoneName = null,
   nextDispatchAt = null,
-  aside = null,
+  intro = null,
 }: {
   snapshot: AlertStatusSnapshot;
   token: string | null;
   alert?: AlertDetails | null;
   zoneName?: string | null;
   nextDispatchAt?: string | null;
-  /** Extra panels for the right-hand column, under the dispatcher's alert. */
-  aside?: ReactNode;
+  /** Shown above the title. The public demo uses it to say that it is one. */
+  intro?: ReactNode;
 }) {
   const [state, dispatch] = useReducer(consoleReducer, snapshot, initialConsoleState);
 
@@ -131,6 +131,7 @@ export function AlertConsole({
 
   return (
     <main className="mx-auto max-w-[1152px] px-4 pt-6 pb-16 sm:px-6">
+      {intro}
       <header className="mb-5">
         <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
           <h1 className="text-2xl leading-8 font-semibold tracking-[-0.01em]">
@@ -158,10 +159,9 @@ export function AlertConsole({
           <ReachSummary tally={totals} />
           <HouseholdStatusGrid state={state} />
         </div>
-        {(alert !== null || aside !== null) && (
+        {alert !== null && (
           <aside className="grid content-start gap-3 self-start lg:sticky lg:top-4">
-            {alert !== null && <AlertBrief alert={alert} />}
-            {aside}
+            <AlertBrief alert={alert} />
           </aside>
         )}
       </div>
