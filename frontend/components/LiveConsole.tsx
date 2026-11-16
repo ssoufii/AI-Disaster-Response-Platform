@@ -35,13 +35,11 @@ type Phase =
 function Waiting({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <main className="mx-auto max-w-[1152px] px-4 pt-6 pb-16 sm:px-6">
+      <AboutDemo />
       <h1 className="text-2xl leading-8 font-semibold tracking-[-0.01em]">{title}</h1>
       <div className="mt-3 flex max-w-xl items-start gap-3" role="status" aria-live="polite">
         <span className="tone-dot live-dot mt-2" data-tone="grey" aria-hidden />
         <p className="text-base">{children}</p>
-      </div>
-      <div className="mt-6 sm:max-w-sm">
-        <AboutDemo />
       </div>
     </main>
   );
@@ -135,7 +133,7 @@ export function LiveConsole() {
       alert={phase.alert}
       zoneName={phase.alert.zone_name}
       nextDispatchAt={phase.alert.next_dispatch_at}
-      aside={<AboutDemo />}
+      intro={<AboutDemo />}
     />
   );
 }
